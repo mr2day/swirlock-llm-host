@@ -1,4 +1,4 @@
-# Swirlock LLM Server
+# Swirlock LLM Host
 
 Small NestJS model-host server for one local Ollama model.
 

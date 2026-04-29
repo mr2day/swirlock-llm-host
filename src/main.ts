@@ -23,7 +23,7 @@ async function bootstrap() {
   const host = process.env.HOST ?? '0.0.0.0';
 
   await app.listen(port, host);
-  console.log(`Swirlock LLM Server listening on http://${host}:${port}`);
+  console.log(`Swirlock LLM Host listening on http://${host}:${port}`);
 }
 
 void bootstrap();

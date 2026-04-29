@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: 'swirlock-llm-server',
+      name: 'swirlock-llm-host',
       script: 'dist/main.js',
       instances: 1,
       autorestart: true,
