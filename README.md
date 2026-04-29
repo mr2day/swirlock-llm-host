@@ -2,7 +2,7 @@
 
 Small NestJS model-host server for the local Ollama model `qwen3.5:9b`.
 
-This service is intentionally agnostic. It does not know whether callers are doing chat, RAG support, memory work, classification, or image understanding. Its job is to expose the model safely and protect the model host with size, timeout, token, and concurrency limits.
+This service is intentionally agnostic. It does not know whether callers are doing chat, RAG support, memory work, classification, or image understanding. Its job is to expose the model safely and protect the model host with size and concurrency limits.
 
 It accepts text plus optional image input and returns text only. It does not support image generation.
 
@@ -76,7 +76,6 @@ Text-only request:
   },
   "options": {
     "temperature": 0.2,
-    "maxOutputTokens": 256,
     "thinking": false,
     "responseFormat": "text"
   }
@@ -127,13 +126,7 @@ Response:
     },
     "finishReason": "stop",
     "generatedAt": "2026-04-29T12:00:01.000Z",
-    "usage": {
-      "inputTokens": 10,
-      "outputTokens": 20,
-      "totalTokens": 30
-    },
     "appliedOptions": {
-      "maxOutputTokens": 256,
       "responseFormat": "text",
       "thinking": false,
       "temperature": 0.2
@@ -166,7 +159,6 @@ Send one JSON message per WebSocket connection:
       "parts": [{ "type": "text", "text": "Describe what you see." }]
     },
     "options": {
-      "maxOutputTokens": 256,
       "temperature": 0.2,
       "responseFormat": "text",
       "thinking": false
@@ -181,7 +173,7 @@ The server streams JSON events:
 - `queued`
 - `started`
 - `thinking`
-- `token`
+- `chunk`
 - `done`
 - `error`
 
@@ -196,16 +188,12 @@ The host enforces:
 - `MAX_TEXT_CHARS`
 - `MAX_IMAGES`
 - `MAX_IMAGE_BYTES`
-- `MAX_OUTPUT_TOKENS`
-- `MAX_CONTEXT_TOKENS`
 - `MAX_CONCURRENT_REQUESTS`
 - `MAX_QUEUE_SIZE`
-- `REQUEST_TIMEOUT_MS`
-- `IMAGE_FETCH_TIMEOUT_MS`
 
-Caller options are treated as hints. The host only accepts a small safe option set and clamps output tokens to `MAX_OUTPUT_TOKENS`.
+Caller options are treated as hints. The host only accepts a small safe option set.
 
-`MODEL_THINKING=false` is the default so thinking-capable models return usable response text through this API instead of spending the output budget on internal reasoning fields.
+`MODEL_THINKING=false` is the default so thinking-capable models return usable response text through this API instead of spending work on internal reasoning fields.
 
 ## Keeping The Model Loaded
 

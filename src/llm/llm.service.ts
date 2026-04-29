@@ -1,12 +1,6 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Ollama, type ChatResponse, type Message, type Options } from 'ollama';
-import {
-  limitExceeded,
-  modelOverloaded,
-  timeout,
-  upstreamUnavailable,
-  validationFailed,
-} from './api-error';
+import { limitExceeded, modelOverloaded, upstreamUnavailable, validationFailed } from './api-error';
 import {
   formatKeepAlive,
   getBooleanEnv,
@@ -66,13 +60,12 @@ export type StreamEvent =
   | { type: 'queued'; meta: ReturnType<typeof createApiMeta>; data: { position: number } }
   | { type: 'started'; meta: ReturnType<typeof createApiMeta> }
   | { type: 'thinking'; meta: ReturnType<typeof createApiMeta>; data: { text: string } }
-  | { type: 'token'; meta: ReturnType<typeof createApiMeta>; data: { text: string } }
+  | { type: 'chunk'; meta: ReturnType<typeof createApiMeta>; data: { text: string } }
   | {
       type: 'done';
       meta: ReturnType<typeof createApiMeta>;
       data: {
         finishReason: 'stop' | 'length' | 'error';
-        usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
         appliedOptions: InferenceOptions;
       };
     };
@@ -89,27 +82,14 @@ export class LlmService implements OnModuleInit {
   private readonly maxTextChars = getIntegerEnv('MAX_TEXT_CHARS', 20000);
   private readonly maxImages = getIntegerEnv('MAX_IMAGES', getIntegerEnv('MAX_IMAGE_FILES', 8));
   private readonly maxImageBytes = getIntegerEnv('MAX_IMAGE_BYTES', 20 * 1024 * 1024);
-  private readonly maxOutputTokens = getIntegerEnv('MAX_OUTPUT_TOKENS', 1024);
-  private readonly defaultOutputTokens = Math.min(
-    getIntegerEnv('DEFAULT_OUTPUT_TOKENS', 512),
-    this.maxOutputTokens,
-  );
-  private readonly maxContextTokens = getIntegerEnv('MAX_CONTEXT_TOKENS', 8192);
   private readonly maxConcurrentRequests = getIntegerEnv('MAX_CONCURRENT_REQUESTS', 1);
   private readonly maxQueueSize = getIntegerEnv('MAX_QUEUE_SIZE', 8);
-  private readonly requestTimeoutMs = getIntegerEnv('REQUEST_TIMEOUT_MS', 120000);
-  private readonly imageFetchTimeoutMs = getIntegerEnv('IMAGE_FETCH_TIMEOUT_MS', 15000);
   private activeRequests = 0;
   private queueSequence = 0;
   private readonly waitQueue: QueueEntry[] = [];
 
   private readonly ollama = new Ollama({
     host: this.ollamaHost,
-    fetch: ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
-      fetch(input, {
-        ...init,
-        signal: init?.signal ?? AbortSignal.timeout(this.requestTimeoutMs),
-      })) as typeof fetch,
   });
 
   async onModuleInit(): Promise<void> {
@@ -153,9 +133,6 @@ export class LlmService implements OnModuleInit {
         ...(appliedOptions.responseFormat === 'json' ? { format: 'json' } : {}),
       });
 
-      const inputTokens = response.prompt_eval_count;
-      const outputTokens = response.eval_count;
-
       return {
         meta: createApiMeta(correlationId),
         data: {
@@ -165,17 +142,6 @@ export class LlmService implements OnModuleInit {
           },
           finishReason: mapFinishReason(response.done_reason),
           generatedAt: new Date().toISOString(),
-          usage:
-            inputTokens !== undefined || outputTokens !== undefined
-              ? {
-                  inputTokens,
-                  outputTokens,
-                  totalTokens:
-                    inputTokens !== undefined && outputTokens !== undefined
-                      ? inputTokens + outputTokens
-                      : undefined,
-                }
-              : undefined,
           appliedOptions: appliedOptions.publicOptions,
         },
       };
@@ -244,32 +210,18 @@ export class LlmService implements OnModuleInit {
           }
 
           if (chunk.message?.content) {
-            emit({ type: 'token', meta, data: { text: chunk.message.content } });
+            emit({ type: 'chunk', meta, data: { text: chunk.message.content } });
           }
         }
       } finally {
         signal?.removeEventListener('abort', abortStream);
       }
 
-      const inputTokens = finalChunk?.prompt_eval_count;
-      const outputTokens = finalChunk?.eval_count;
-
       emit({
         type: 'done',
         meta,
         data: {
           finishReason: mapFinishReason(finalChunk?.done_reason),
-          usage:
-            inputTokens !== undefined || outputTokens !== undefined
-              ? {
-                  inputTokens,
-                  outputTokens,
-                  totalTokens:
-                    inputTokens !== undefined && outputTokens !== undefined
-                      ? inputTokens + outputTokens
-                      : undefined,
-                }
-              : undefined,
           appliedOptions: appliedOptions.publicOptions,
         },
       });
@@ -500,7 +452,6 @@ export class LlmService implements OnModuleInit {
 
     const response = await fetch(url, {
       headers: { Accept: 'image/*' },
-      signal: AbortSignal.timeout(this.imageFetchTimeoutMs),
     });
 
     if (!response.ok) {
@@ -544,23 +495,13 @@ export class LlmService implements OnModuleInit {
     const responseFormat = normalizeResponseFormat(options?.responseFormat);
     const thinking =
       typeof options?.thinking === 'boolean' ? options.thinking : this.thinkingEnabled;
-    const maxOutputTokens = clampPositiveInteger(
-      options?.maxOutputTokens,
-      this.defaultOutputTokens,
-      this.maxOutputTokens,
-      'options.maxOutputTokens',
-    );
 
     const publicOptions: InferenceOptions = {
-      maxOutputTokens,
       responseFormat,
       thinking,
     };
 
-    const ollamaOptions: Partial<Options> = {
-      num_predict: maxOutputTokens,
-      num_ctx: this.maxContextTokens,
-    };
+    const ollamaOptions: Partial<Options> = {};
 
     if (options?.temperature !== undefined) {
       publicOptions.temperature = clampNumber(options.temperature, 0, 2, 'options.temperature');
@@ -628,7 +569,7 @@ export class LlmService implements OnModuleInit {
         const index = this.waitQueue.indexOf(entry);
         if (index >= 0) {
           this.waitQueue.splice(index, 1);
-          reject(timeout('Queued model request was aborted before it started.'));
+          reject(validationFailed('Queued model request was aborted before it started.'));
         }
       };
 
@@ -653,7 +594,7 @@ export class LlmService implements OnModuleInit {
     const [entry] = this.waitQueue.splice(nextIndex, 1);
 
     if (entry.signal?.aborted) {
-      entry.reject(timeout('Queued model request was aborted before it started.'));
+      entry.reject(validationFailed('Queued model request was aborted before it started.'));
       this.startNextQueuedRequest();
       return;
     }
@@ -709,13 +650,6 @@ export class LlmService implements OnModuleInit {
     ) {
       throw validationFailed('requestContext.requestedAt must be an ISO 8601 UTC timestamp.');
     }
-
-    if (
-      context.timeoutMs !== undefined &&
-      (!Number.isInteger(context.timeoutMs) || context.timeoutMs < 1)
-    ) {
-      throw validationFailed('requestContext.timeoutMs must be a positive integer.');
-    }
   }
 
   private async getRuntimeState(): Promise<RuntimeState> {
@@ -746,15 +680,9 @@ export class LlmService implements OnModuleInit {
   }
 
   private normalizeUpstreamError(error: unknown): Error {
-    if (error instanceof Error && error.name === 'TimeoutError') {
-      return timeout('Model host request timed out.', {
-        requestTimeoutMs: this.requestTimeoutMs,
-      });
-    }
-
     if (error instanceof Error && error.name === 'AbortError') {
-      return timeout('Model host request was aborted.', {
-        requestTimeoutMs: this.requestTimeoutMs,
+      return upstreamUnavailable('Ollama request was aborted.', {
+        modelId: this.modelId,
       });
     }
 
@@ -782,10 +710,7 @@ export class LlmService implements OnModuleInit {
       maxTextChars: this.maxTextChars,
       maxImages: this.imageInputEnabled ? this.maxImages : 0,
       maxImageBytes: this.imageInputEnabled ? this.maxImageBytes : 0,
-      maxOutputTokens: this.maxOutputTokens,
-      maxContextTokens: this.maxContextTokens,
       maxConcurrentRequests: this.maxConcurrentRequests,
-      requestTimeoutMs: this.requestTimeoutMs,
     };
   }
 
@@ -814,23 +739,6 @@ function normalizeResponseFormat(value: unknown): 'text' | 'json' {
   }
 
   throw validationFailed('options.responseFormat must be text or json.');
-}
-
-function clampPositiveInteger(
-  value: unknown,
-  fallback: number,
-  max: number,
-  fieldName: string,
-): number {
-  if (value === undefined) {
-    return fallback;
-  }
-
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
-    throw validationFailed(`${fieldName} must be a positive integer.`);
-  }
-
-  return Math.min(value, max);
 }
 
 function clampInteger(value: unknown, min: number, max: number, fieldName: string): number {

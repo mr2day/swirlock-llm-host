@@ -7,7 +7,6 @@ export type ApiErrorCode =
   | 'model_unavailable'
   | 'model_overloaded'
   | 'limit_exceeded'
-  | 'timeout'
   | 'internal_error';
 
 export interface ApiErrorBody {
@@ -53,15 +52,6 @@ export function modelOverloaded(message: string, details?: Record<string, unknow
 export function upstreamUnavailable(message: string, details?: Record<string, unknown>) {
   return new ApiErrorException(HttpStatus.BAD_GATEWAY, {
     code: 'upstream_unavailable',
-    message,
-    retryable: true,
-    details,
-  });
-}
-
-export function timeout(message: string, details?: Record<string, unknown>) {
-  return new ApiErrorException(HttpStatus.GATEWAY_TIMEOUT, {
-    code: 'timeout',
     message,
     retryable: true,
     details,

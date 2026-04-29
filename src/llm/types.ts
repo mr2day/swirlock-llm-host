@@ -19,7 +19,6 @@ export interface RequestContext {
   callerService: string;
   priority: Priority;
   requestedAt: string;
-  timeoutMs?: number;
   debug?: boolean;
 }
 
@@ -44,7 +43,6 @@ export interface InferenceInput {
 export interface InferenceOptions {
   temperature?: number;
   topP?: number;
-  maxOutputTokens?: number;
   stopSequences?: string[];
   seed?: number;
   responseFormat?: ResponseFormat;
@@ -57,12 +55,6 @@ export interface InferRequest {
   options?: InferenceOptions;
 }
 
-export interface Usage {
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-}
-
 export interface InferData {
   modelId: string;
   output: {
@@ -70,7 +62,6 @@ export interface InferData {
   };
   finishReason: FinishReason;
   generatedAt: string;
-  usage?: Usage;
   appliedOptions?: InferenceOptions;
 }
 
@@ -87,10 +78,7 @@ export interface ModelLimits {
   maxTextChars: number;
   maxImages: number;
   maxImageBytes: number;
-  maxOutputTokens: number;
-  maxContextTokens?: number;
   maxConcurrentRequests: number;
-  requestTimeoutMs: number;
 }
 
 export interface ModelCapacity {

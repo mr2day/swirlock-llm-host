@@ -219,9 +219,6 @@ function fallbackCode(status: number): ApiErrorBody['code'] {
   if (status === HttpStatus.TOO_MANY_REQUESTS) {
     return 'model_overloaded';
   }
-  if (status === HttpStatus.GATEWAY_TIMEOUT) {
-    return 'timeout';
-  }
   if (status >= 500) {
     return 'internal_error';
   }

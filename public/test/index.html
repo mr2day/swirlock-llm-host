@@ -356,7 +356,7 @@
       .settings {
         display: grid;
         grid-template-columns:
-          auto minmax(88px, 130px) minmax(88px, 130px) minmax(88px, 120px)
+          auto minmax(88px, 130px) minmax(88px, 120px)
           auto auto auto;
         gap: 8px;
         align-items: center;
@@ -498,10 +498,6 @@
               +
             </button>
             <div class="setting">
-              <label for="tokens">Max tokens</label>
-              <input id="tokens" type="number" min="1" max="1024" value="512" />
-            </div>
-            <div class="setting">
               <label for="temperature">Temperature</label>
               <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.2" />
             </div>
@@ -534,7 +530,6 @@
       const sendButton = document.getElementById("send");
       const attachButton = document.getElementById("attach");
       const fileInput = document.getElementById("file");
-      const tokensEl = document.getElementById("tokens");
       const temperatureEl = document.getElementById("temperature");
       const formatEl = document.getElementById("format");
       const thinkingEl = document.getElementById("thinking");
@@ -730,7 +725,6 @@
           },
           input: { parts },
           options: {
-            maxOutputTokens: Number(tokensEl.value || 512),
             temperature: Number(temperatureEl.value || 0.2),
             responseFormat: formatEl.value,
             thinking: thinkingEl.checked,
@@ -745,7 +739,7 @@
         stopButton.classList.toggle("visible", value);
       }
 
-      function connectStream(payload, assistantParts, startedAt) {
+      function connectStream(payload, assistantParts) {
         const protocol = location.protocol === "https:" ? "wss:" : "ws:";
         const socket = new WebSocket(`${protocol}//${location.host}/v2/infer/stream`);
         activeSocket = socket;
@@ -782,23 +776,15 @@
             return;
           }
 
-          if (message.type === "token") {
+          if (message.type === "chunk") {
             assistantParts.answerText.textContent += message.data?.text || "";
             scrollToBottom();
             return;
           }
 
           if (message.type === "done") {
-            const elapsedMs = Math.round(performance.now() - startedAt);
-            const usage = message.data?.usage || {};
             const finish = message.data?.finishReason || "stop";
-            const tokenText = `${usage.outputTokens ?? "?"}/${usage.totalTokens ?? "?"}`;
-            assistantParts.messageMeta.textContent = `finish: ${finish} | tokens: ${tokenText} | time: ${(elapsedMs / 1000).toFixed(1)}s | request: ${message.meta?.requestId || ""}`;
-            if (finish === "length") {
-              assistantParts.messageMeta.textContent =
-                `Output hit the token limit. ` + assistantParts.messageMeta.textContent;
-              assistantParts.messageMeta.classList.add("error");
-            }
+            assistantParts.messageMeta.textContent = `finish: ${finish} | request: ${message.meta?.requestId || ""}`;
             setStatus("Ready", "ok");
             refreshStatus();
             return;
@@ -851,7 +837,7 @@
         clearComposer();
         setRunning(true);
         setStatus("Connecting...", "");
-        connectStream(payload, assistantParts, performance.now());
+        connectStream(payload, assistantParts);
       }
 
       async function refreshStatus() {
