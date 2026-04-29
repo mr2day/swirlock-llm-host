@@ -194,6 +194,7 @@
       }
 
       .answer {
+        width: 100%;
         min-height: 220px;
         white-space: pre-wrap;
         line-height: 1.5;
@@ -201,6 +202,8 @@
         border-radius: 6px;
         padding: 12px;
         background: var(--field);
+        resize: vertical;
+        overflow: hidden;
       }
 
       .meta {
@@ -208,6 +211,10 @@
         color: var(--muted);
         font-size: 13px;
         overflow-wrap: anywhere;
+      }
+
+      .notice {
+        color: var(--danger);
       }
 
       @media (max-width: 820px) {
@@ -273,7 +280,7 @@
 
       <section style="margin-top: 16px">
         <label for="answer">Answer</label>
-        <div id="answer" class="answer"></div>
+        <textarea id="answer" class="answer" readonly></textarea>
         <div id="meta" class="meta"></div>
         <div class="actions">
           <button id="clearAll" type="button">Reset</button>
@@ -313,6 +320,12 @@
         status.className = `status ${kind}`.trim();
       }
 
+      function setAnswer(value) {
+        answer.value = value || "";
+        answer.style.height = "auto";
+        answer.style.height = `${Math.max(220, answer.scrollHeight + 4)}px`;
+      }
+
       function setImage(dataUrl, mimeType) {
         imageDataUrl = dataUrl;
         imageMimeType = mimeType;
@@ -345,7 +358,11 @@
           const ready = payload.data?.ready;
           const loaded = payload.data?.loaded;
           const modelId = payload.data?.modelId || "model";
-          setStatus(`${modelId}: ${ready && loaded ? "ready" : "not ready"}`, ready ? "ok" : "error");
+          const thinking = payload.data?.runtime?.thinkingEnabled ? "thinking on" : "thinking off";
+          setStatus(
+            `${modelId}: ${ready && loaded ? "ready" : "not ready"} | ${thinking}`,
+            ready ? "ok" : "error",
+          );
         } catch (error) {
           setStatus(error.message || "Status unavailable", "error");
         }
@@ -354,7 +371,7 @@
       async function runInference() {
         const text = question.value.trim();
         if (!text && !imageDataUrl) {
-          answer.textContent = "";
+          setAnswer("");
           meta.textContent = "Provide text, an image, or both.";
           return;
         }
@@ -384,8 +401,9 @@
         };
 
         submit.disabled = true;
-        answer.textContent = "";
+        setAnswer("");
         meta.textContent = "Running...";
+        const startedAt = performance.now();
 
         try {
           const response = await fetch("/v2/infer", {
@@ -399,14 +417,23 @@
           const payload = await response.json();
           if (!response.ok) throw new Error(payload.error?.message || "Inference request failed");
 
-          answer.textContent = payload.data?.output?.text || "";
-          meta.textContent = [
+          const elapsedMs = Math.round(performance.now() - startedAt);
+          const finishReason = payload.data?.finishReason || "";
+          const usage = payload.data?.usage || {};
+          setAnswer(payload.data?.output?.text || "");
+          const metaParts = [
             `model: ${payload.data?.modelId || ""}`,
-            `finish: ${payload.data?.finishReason || ""}`,
+            `finish: ${finishReason}`,
+            `tokens: ${usage.outputTokens ?? "?"}/${usage.totalTokens ?? "?"}`,
+            `time: ${(elapsedMs / 1000).toFixed(1)}s`,
             `request: ${payload.meta?.requestId || ""}`,
-          ].join(" | ");
+          ];
+          meta.innerHTML =
+            finishReason === "length"
+              ? `<span class="notice">Output hit the token limit. Increase Max Tokens if you need the rest.</span><br>${metaParts.join(" | ")}`
+              : metaParts.join(" | ");
         } catch (error) {
-          answer.textContent = "";
+          setAnswer("");
           meta.textContent = error.message || "Inference failed";
         } finally {
           submit.disabled = false;
@@ -443,7 +470,7 @@
       clearImage.addEventListener("click", resetImage);
       clearAll.addEventListener("click", () => {
         question.value = "";
-        answer.textContent = "";
+        setAnswer("");
         meta.textContent = "";
         resetImage();
       });
