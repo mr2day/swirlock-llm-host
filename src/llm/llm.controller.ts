@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, Post } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpCode, HttpStatus, Post } from '@nestjs/common';
 import { validationFailed } from './api-error';
 import { LlmService } from './llm.service';
 import type {
@@ -15,6 +15,7 @@ export class LlmController {
   constructor(private readonly llmService: LlmService) {}
 
   @Post('infer')
+  @HttpCode(HttpStatus.OK)
   async infer(
     @Headers('x-correlation-id') correlationId: string | undefined,
     @Body() body: InferRequest,
@@ -37,6 +38,7 @@ export class LlmController {
   }
 
   @Post('model/preload')
+  @HttpCode(HttpStatus.ACCEPTED)
   async preloadModel(
     @Headers('x-correlation-id') correlationId: string | undefined,
     @Body() body: ModelLifecycleRequest,
@@ -45,6 +47,7 @@ export class LlmController {
   }
 
   @Post('model/unload')
+  @HttpCode(HttpStatus.ACCEPTED)
   async unloadModel(
     @Headers('x-correlation-id') correlationId: string | undefined,
     @Body() body: ModelLifecycleRequest,
