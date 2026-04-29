@@ -13,6 +13,10 @@ export function getNumberEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+export function getIntegerEnv(name: string, fallback: number): number {
+  return Math.trunc(getNumberEnv(name, fallback));
+}
+
 export function getBooleanEnv(name: string, fallback: boolean): boolean {
   const value = process.env[name];
   if (value === undefined) {
@@ -25,4 +29,8 @@ export function getBooleanEnv(name: string, fallback: boolean): boolean {
 export function parseKeepAlive(value: string): string | number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : value;
+}
+
+export function formatKeepAlive(value: string | number): string {
+  return typeof value === 'number' ? String(value) : value;
 }

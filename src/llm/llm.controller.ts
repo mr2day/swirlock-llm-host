@@ -1,28 +1,62 @@
-import { Body, Controller, Post, UploadedFiles, UseInterceptors } from '@nestjs/common';
-import { FilesInterceptor } from '@nestjs/platform-express';
-import { memoryStorage } from 'multer';
+import { Body, Controller, Get, Headers, Post } from '@nestjs/common';
+import { validationFailed } from './api-error';
 import { LlmService } from './llm.service';
-import { getNumberEnv } from './runtime';
-import type { GenerateBody, GenerateResponse } from './types';
+import type {
+  HealthResponse,
+  InferRequest,
+  InferResponse,
+  ModelLifecycleRequest,
+  ModelLifecycleResponse,
+  ModelStatusResponse,
+} from './types';
 
-@Controller('api')
+@Controller('v2')
 export class LlmController {
   constructor(private readonly llmService: LlmService) {}
 
-  @Post('generate')
-  @UseInterceptors(
-    FilesInterceptor('images', getNumberEnv('MAX_IMAGE_FILES', 8), {
-      storage: memoryStorage(),
-      limits: {
-        fileSize: getNumberEnv('MAX_IMAGE_BYTES', 20 * 1024 * 1024),
-        files: getNumberEnv('MAX_IMAGE_FILES', 8),
-      },
-    }),
-  )
-  async generate(
-    @Body() body: GenerateBody,
-    @UploadedFiles() files: Express.Multer.File[] = [],
-  ): Promise<GenerateResponse> {
-    return this.llmService.generate(body, files);
+  @Post('infer')
+  async infer(
+    @Headers('x-correlation-id') correlationId: string | undefined,
+    @Body() body: InferRequest,
+  ): Promise<InferResponse> {
+    return this.llmService.infer(requireCorrelationId(correlationId), body);
   }
+
+  @Get('health')
+  async health(
+    @Headers('x-correlation-id') correlationId: string | undefined,
+  ): Promise<HealthResponse> {
+    return this.llmService.health(requireCorrelationId(correlationId));
+  }
+
+  @Get('model/status')
+  async modelStatus(
+    @Headers('x-correlation-id') correlationId: string | undefined,
+  ): Promise<ModelStatusResponse> {
+    return this.llmService.modelStatus(requireCorrelationId(correlationId));
+  }
+
+  @Post('model/preload')
+  async preloadModel(
+    @Headers('x-correlation-id') correlationId: string | undefined,
+    @Body() body: ModelLifecycleRequest,
+  ): Promise<ModelLifecycleResponse> {
+    return this.llmService.preload(requireCorrelationId(correlationId), body);
+  }
+
+  @Post('model/unload')
+  async unloadModel(
+    @Headers('x-correlation-id') correlationId: string | undefined,
+    @Body() body: ModelLifecycleRequest,
+  ): Promise<ModelLifecycleResponse> {
+    return this.llmService.unload(requireCorrelationId(correlationId), body);
+  }
+}
+
+function requireCorrelationId(value: string | undefined): string {
+  if (!value?.trim()) {
+    throw validationFailed('x-correlation-id header is required.');
+  }
+
+  return value.trim();
 }

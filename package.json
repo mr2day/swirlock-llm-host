@@ -1,7 +1,7 @@
 {
   "name": "swirlock-utility-llm-api",
   "version": "1.0.0",
-  "description": "LAN-accessible NestJS API for a local Ollama vision-language model.",
+  "description": "LAN-accessible model host API for a local Ollama vision-language model.",
   "main": "dist/main.js",
   "scripts": {
     "build": "nest build",
@@ -32,7 +32,6 @@
     "@nestjs/core": "^11.1.19",
     "@nestjs/platform-express": "^11.1.19",
     "dotenv": "^17.4.2",
-    "multer": "^2.1.1",
     "ollama": "^0.6.3",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"
@@ -41,7 +40,6 @@
     "@nestjs/cli": "^11.0.21",
     "@nestjs/schematics": "^11.1.0",
     "@types/express": "^5.0.6",
-    "@types/multer": "^2.1.0",
     "@types/node": "^25.6.0",
     "prettier": "^3.8.3",
     "ts-node": "^10.9.2",
