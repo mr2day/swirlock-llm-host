@@ -41,12 +41,9 @@ export interface InferenceInput {
 }
 
 export interface InferenceOptions {
-  temperature?: number;
-  topP?: number;
-  stopSequences?: string[];
-  seed?: number;
   responseFormat?: ResponseFormat;
   thinking?: boolean;
+  ollama?: Record<string, unknown>;
 }
 
 export interface InferRequest {
@@ -57,6 +54,7 @@ export interface InferRequest {
 
 export interface InferData {
   modelId: string;
+  registrationNumber: string;
   output: {
     text: string;
   };
@@ -74,18 +72,12 @@ export interface ModelCapabilities {
   imageOutput: boolean;
 }
 
-export interface ModelLimits {
-  maxTextChars: number;
-  maxImages: number;
-  maxImageBytes: number;
-  maxConcurrentRequests: number;
-}
-
 export interface ModelCapacity {
   activeRequests: number;
-  maxConcurrentRequests: number;
-  queueDepth?: number;
-  maxQueueSize?: number;
+  modelSlots: number;
+  queueDepth: number;
+  currentRegistrationNumber?: string;
+  averageRequestDurationMs?: number;
 }
 
 export interface HealthData {
@@ -101,7 +93,6 @@ export interface ModelStatusData {
   loaded: boolean;
   keepAlive: string;
   capabilities: ModelCapabilities;
-  limits: ModelLimits;
   capacity: ModelCapacity;
   runtime?: Record<string, unknown>;
 }

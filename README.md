@@ -2,7 +2,7 @@
 
 Small NestJS model-host server for the local Ollama model `qwen3.5:9b`.
 
-This service is intentionally agnostic. It does not know whether callers are doing chat, RAG support, memory work, classification, or image understanding. Its job is to expose the model safely and protect the model host with size and concurrency limits.
+This service is intentionally agnostic. It does not know whether callers are doing chat, RAG support, memory work, classification, or image understanding. Its job is to expose the model safely, keep it loaded, and serialize access to the local model runner.
 
 It accepts text plus optional image input and returns text only. It does not support image generation.
 
@@ -75,9 +75,11 @@ Text-only request:
     ]
   },
   "options": {
-    "temperature": 0.2,
     "thinking": false,
-    "responseFormat": "text"
+    "responseFormat": "text",
+    "ollama": {
+      "temperature": 0.2
+    }
   }
 }
 ```
@@ -121,6 +123,7 @@ Response:
   },
   "data": {
     "modelId": "qwen3.5:9b",
+    "registrationNumber": "U-000001",
     "output": {
       "text": "The image shows ..."
     },
@@ -129,7 +132,9 @@ Response:
     "appliedOptions": {
       "responseFormat": "text",
       "thinking": false,
-      "temperature": 0.2
+      "ollama": {
+        "temperature": 0.2
+      }
     }
   }
 }
@@ -159,9 +164,11 @@ Send one JSON message per WebSocket connection:
       "parts": [{ "type": "text", "text": "Describe what you see." }]
     },
     "options": {
-      "temperature": 0.2,
       "responseFormat": "text",
-      "thinking": false
+      "thinking": false,
+      "ollama": {
+        "temperature": 0.2
+      }
     }
   }
 }
@@ -177,21 +184,25 @@ The server streams JSON events:
 - `done`
 - `error`
 
-Open multiple WebSocket connections for multiple callers. The host enforces
-`MAX_CONCURRENT_REQUESTS` and queues up to `MAX_QUEUE_SIZE`; extra requests receive a retryable
-`model_overloaded` error.
+Open multiple WebSocket connections for multiple callers. The host runs exactly one model request
+at a time and queues the rest. Queued events include:
 
-## Model Protection
+- `registrationNumber`
+- `position`
+- `estimatedWaitMs`, when the server has recent request duration samples
+- `estimatedStartAt`, when the server has recent request duration samples
+- `tryAgainAt`, same value as `estimatedStartAt` for callers that choose to disconnect and retry
 
-The host enforces:
+## Host Protection
 
-- `MAX_TEXT_CHARS`
-- `MAX_IMAGES`
-- `MAX_IMAGE_BYTES`
-- `MAX_CONCURRENT_REQUESTS`
-- `MAX_QUEUE_SIZE`
+The host keeps only host-level protections:
 
-Caller options are treated as hints. The host only accepts a small safe option set.
+- `JSON_BODY_LIMIT`, default `256mb`
+- one hardcoded active model request at a time
+- an in-memory queue for additional requests
+
+The host does not impose text length, image count, image byte, output length, elapsed time, or rate
+limits. Callers can pass Ollama generation settings through `options.ollama`.
 
 `MODEL_THINKING=false` is the default so thinking-capable models return usable response text through this API instead of spending work on internal reasoning fields.
 

@@ -10,7 +10,7 @@ import { attachLlmWebSocketServer } from './llm/llm.websocket';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
-  const jsonLimit = process.env.JSON_BODY_LIMIT ?? '50mb';
+  const jsonLimit = process.env.JSON_BODY_LIMIT ?? '256mb';
 
   app.useGlobalFilters(new HttpExceptionFilter());
   app.enableCors({ origin: true });

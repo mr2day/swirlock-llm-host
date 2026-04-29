@@ -216,9 +216,6 @@ function fallbackCode(status: number): ApiErrorBody['code'] {
   if (status === HttpStatus.PAYLOAD_TOO_LARGE) {
     return 'limit_exceeded';
   }
-  if (status === HttpStatus.TOO_MANY_REQUESTS) {
-    return 'model_overloaded';
-  }
   if (status >= 500) {
     return 'internal_error';
   }

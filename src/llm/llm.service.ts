@@ -1,13 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Ollama, type ChatResponse, type Message, type Options } from 'ollama';
-import { limitExceeded, modelOverloaded, upstreamUnavailable, validationFailed } from './api-error';
-import {
-  formatKeepAlive,
-  getBooleanEnv,
-  getIntegerEnv,
-  getStringEnv,
-  parseKeepAlive,
-} from './runtime';
+import { upstreamUnavailable, validationFailed } from './api-error';
+import { formatKeepAlive, getBooleanEnv, getStringEnv, parseKeepAlive } from './runtime';
 import { createApiMeta } from './response-meta';
 import type {
   HealthResponse,
@@ -19,13 +13,14 @@ import type {
   ModelCapabilities,
   ModelLifecycleRequest,
   ModelLifecycleResponse,
-  ModelLimits,
   ModelStatusResponse,
   RequestContext,
 } from './types';
 
 const DEFAULT_MODEL = 'qwen3.5:9b';
 const DEFAULT_OLLAMA_HOST = 'http://127.0.0.1:11434';
+const MODEL_SLOTS = 1;
+const RECENT_DURATION_SAMPLE_SIZE = 20;
 
 interface NormalizedInput {
   text: string;
@@ -48,23 +43,46 @@ interface RuntimeState {
 }
 
 interface QueueEntry {
+  registrationNumber: string;
   priority: RequestContext['priority'];
   sequence: number;
-  resolve: (release: () => void) => void;
+  resolve: (slot: AcquiredModelSlot) => void;
   reject: (error: Error) => void;
   signal?: AbortSignal;
 }
 
+interface AcquiredModelSlot {
+  registrationNumber: string;
+  release: () => void;
+}
+
+interface QueueEstimate {
+  registrationNumber: string;
+  position: number;
+  estimatedWaitMs?: number;
+  estimatedStartAt?: string;
+  tryAgainAt?: string;
+}
+
 export type StreamEvent =
-  | { type: 'accepted'; meta: ReturnType<typeof createApiMeta> }
-  | { type: 'queued'; meta: ReturnType<typeof createApiMeta>; data: { position: number } }
-  | { type: 'started'; meta: ReturnType<typeof createApiMeta> }
+  | {
+      type: 'accepted';
+      meta: ReturnType<typeof createApiMeta>;
+      data: { registrationNumber: string };
+    }
+  | { type: 'queued'; meta: ReturnType<typeof createApiMeta>; data: QueueEstimate }
+  | {
+      type: 'started';
+      meta: ReturnType<typeof createApiMeta>;
+      data: { registrationNumber: string };
+    }
   | { type: 'thinking'; meta: ReturnType<typeof createApiMeta>; data: { text: string } }
   | { type: 'chunk'; meta: ReturnType<typeof createApiMeta>; data: { text: string } }
   | {
       type: 'done';
       meta: ReturnType<typeof createApiMeta>;
       data: {
+        registrationNumber: string;
         finishReason: 'stop' | 'length' | 'error';
         appliedOptions: InferenceOptions;
       };
@@ -79,14 +97,12 @@ export class LlmService implements OnModuleInit {
   private readonly preloadModel = getBooleanEnv('PRELOAD_MODEL', true);
   private readonly imageInputEnabled = getBooleanEnv('MODEL_IMAGE_INPUT', true);
   private readonly thinkingEnabled = getBooleanEnv('MODEL_THINKING', false);
-  private readonly maxTextChars = getIntegerEnv('MAX_TEXT_CHARS', 20000);
-  private readonly maxImages = getIntegerEnv('MAX_IMAGES', getIntegerEnv('MAX_IMAGE_FILES', 8));
-  private readonly maxImageBytes = getIntegerEnv('MAX_IMAGE_BYTES', 20 * 1024 * 1024);
-  private readonly maxConcurrentRequests = getIntegerEnv('MAX_CONCURRENT_REQUESTS', 1);
-  private readonly maxQueueSize = getIntegerEnv('MAX_QUEUE_SIZE', 8);
   private activeRequests = 0;
   private queueSequence = 0;
+  private registrationSequence = 0;
+  private currentRegistrationNumber: string | undefined;
   private readonly waitQueue: QueueEntry[] = [];
+  private readonly recentRequestDurationsMs: number[] = [];
 
   private readonly ollama = new Ollama({
     host: this.ollamaHost,
@@ -110,7 +126,7 @@ export class LlmService implements OnModuleInit {
   async infer(correlationId: string, request: InferRequest): Promise<InferResponse> {
     this.assertRequestContext(request?.requestContext);
 
-    const release = await this.acquireModelSlot(request.requestContext.priority);
+    const slot = await this.acquireModelSlot(request.requestContext.priority);
 
     try {
       const input = await this.normalizeInput(request);
@@ -137,6 +153,7 @@ export class LlmService implements OnModuleInit {
         meta: createApiMeta(correlationId),
         data: {
           modelId: response.model,
+          registrationNumber: slot.registrationNumber,
           output: {
             text: response.message?.content ?? '',
           },
@@ -148,7 +165,7 @@ export class LlmService implements OnModuleInit {
     } catch (error) {
       throw this.normalizeUpstreamError(error);
     } finally {
-      release();
+      slot.release();
     }
   }
 
@@ -161,13 +178,16 @@ export class LlmService implements OnModuleInit {
     this.assertRequestContext(request?.requestContext);
 
     const meta = createApiMeta(correlationId);
-    emit({ type: 'accepted', meta });
 
-    const release = await this.acquireModelSlot(
-      request.requestContext.priority,
-      signal,
-      (position) => emit({ type: 'queued', meta, data: { position } }),
+    const slot = await this.acquireModelSlot(request.requestContext.priority, signal, (estimate) =>
+      emit({ type: 'queued', meta, data: estimate }),
     );
+
+    emit({
+      type: 'accepted',
+      meta,
+      data: { registrationNumber: slot.registrationNumber },
+    });
 
     try {
       const input = await this.normalizeInput(request);
@@ -180,7 +200,7 @@ export class LlmService implements OnModuleInit {
         },
       ];
 
-      emit({ type: 'started', meta });
+      emit({ type: 'started', meta, data: { registrationNumber: slot.registrationNumber } });
 
       const stream = await this.ollama.chat({
         model: this.modelId,
@@ -221,6 +241,7 @@ export class LlmService implements OnModuleInit {
         type: 'done',
         meta,
         data: {
+          registrationNumber: slot.registrationNumber,
           finishReason: mapFinishReason(finalChunk?.done_reason),
           appliedOptions: appliedOptions.publicOptions,
         },
@@ -228,7 +249,7 @@ export class LlmService implements OnModuleInit {
     } catch (error) {
       throw this.normalizeUpstreamError(error);
     } finally {
-      release();
+      slot.release();
     }
   }
 
@@ -255,12 +276,12 @@ export class LlmService implements OnModuleInit {
         loaded: state.loaded,
         keepAlive: this.keepAliveText,
         capabilities: this.capabilities,
-        limits: this.limits,
         capacity: {
           activeRequests: this.activeRequests,
-          maxConcurrentRequests: this.maxConcurrentRequests,
+          modelSlots: MODEL_SLOTS,
           queueDepth: this.waitQueue.length,
-          maxQueueSize: this.maxQueueSize,
+          currentRegistrationNumber: this.currentRegistrationNumber,
+          averageRequestDurationMs: this.averageRequestDurationMs,
         },
         runtime: {
           ollamaHost: this.ollamaHost,
@@ -360,24 +381,10 @@ export class LlmService implements OnModuleInit {
       throw validationFailed(`input.parts[${index}].type must be text or image.`);
     }
 
-    if (images.length > this.maxImages) {
-      throw limitExceeded('Image count exceeds host limit.', {
-        maxImages: this.maxImages,
-        receivedImages: images.length,
-      });
-    }
-
     const text = textParts.join('\n\n').trim();
 
     if (!text && images.length === 0) {
       throw validationFailed('Inference input must include text, images, or both.');
-    }
-
-    if (text.length > this.maxTextChars) {
-      throw limitExceeded('Text input exceeds host limit.', {
-        maxTextChars: this.maxTextChars,
-        receivedTextChars: text.length,
-      });
     }
 
     return { text, images };
@@ -405,10 +412,6 @@ export class LlmService implements OnModuleInit {
       );
     }
 
-    if (part.mimeType !== undefined && !part.mimeType.startsWith('image/')) {
-      throw validationFailed(`input.parts[${index}].mimeType must start with image/.`);
-    }
-
     return hasBase64
       ? this.normalizeImageBase64(part.imageBase64 as string, index)
       : this.fetchImageUrl(part.imageUrl as string, index);
@@ -425,15 +428,7 @@ export class LlmService implements OnModuleInit {
       throw validationFailed(`input.parts[${index}].imageBase64 is not valid base64.`);
     }
 
-    const imageBytes = Buffer.from(normalized, 'base64').byteLength;
-
-    if (imageBytes > this.maxImageBytes) {
-      throw limitExceeded('Image payload exceeds host limit.', {
-        maxImageBytes: this.maxImageBytes,
-        receivedImageBytes: imageBytes,
-        partIndex: index,
-      });
-    }
+    Buffer.from(normalized, 'base64');
 
     return normalized;
   }
@@ -466,24 +461,7 @@ export class LlmService implements OnModuleInit {
       throw validationFailed(`input.parts[${index}].imageUrl did not return an image.`);
     }
 
-    const contentLength = response.headers.get('content-length');
-    if (contentLength && Number(contentLength) > this.maxImageBytes) {
-      throw limitExceeded('Image URL content exceeds host limit.', {
-        maxImageBytes: this.maxImageBytes,
-        receivedImageBytes: Number(contentLength),
-        partIndex: index,
-      });
-    }
-
     const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.byteLength > this.maxImageBytes) {
-      throw limitExceeded('Image URL content exceeds host limit.', {
-        maxImageBytes: this.maxImageBytes,
-        receivedImageBytes: buffer.byteLength,
-        partIndex: index,
-      });
-    }
-
     return buffer.toString('base64');
   }
 
@@ -495,69 +473,36 @@ export class LlmService implements OnModuleInit {
     const responseFormat = normalizeResponseFormat(options?.responseFormat);
     const thinking =
       typeof options?.thinking === 'boolean' ? options.thinking : this.thinkingEnabled;
+    const ollamaOptions = normalizeOllamaOptions(options?.ollama);
 
     const publicOptions: InferenceOptions = {
       responseFormat,
       thinking,
+      ...(ollamaOptions !== undefined ? { ollama: ollamaOptions } : {}),
     };
-
-    const ollamaOptions: Partial<Options> = {};
-
-    if (options?.temperature !== undefined) {
-      publicOptions.temperature = clampNumber(options.temperature, 0, 2, 'options.temperature');
-      ollamaOptions.temperature = publicOptions.temperature;
-    }
-
-    if (options?.topP !== undefined) {
-      publicOptions.topP = clampNumber(options.topP, 0, 1, 'options.topP');
-      ollamaOptions.top_p = publicOptions.topP;
-    }
-
-    if (options?.stopSequences !== undefined) {
-      if (
-        !Array.isArray(options.stopSequences) ||
-        !options.stopSequences.every((item) => typeof item === 'string')
-      ) {
-        throw validationFailed('options.stopSequences must be an array of strings.');
-      }
-      publicOptions.stopSequences = options.stopSequences.slice(0, 16);
-      ollamaOptions.stop = publicOptions.stopSequences;
-    }
-
-    if (options?.seed !== undefined) {
-      publicOptions.seed = clampInteger(options.seed, -2147483648, 2147483647, 'options.seed');
-      ollamaOptions.seed = publicOptions.seed;
-    }
 
     return {
       responseFormat,
       thinking,
       publicOptions,
-      ollamaOptions,
+      ollamaOptions: (ollamaOptions ?? {}) as Partial<Options>,
     };
   }
 
   private acquireModelSlot(
     priority: RequestContext['priority'],
     signal?: AbortSignal,
-    onQueued?: (position: number) => void,
-  ): Promise<() => void> {
-    if (this.activeRequests < this.maxConcurrentRequests) {
-      this.activeRequests += 1;
-      return Promise.resolve(() => this.releaseModelSlot());
-    }
+    onQueued?: (estimate: QueueEstimate) => void,
+  ): Promise<AcquiredModelSlot> {
+    const registrationNumber = this.nextRegistrationNumber();
 
-    if (this.waitQueue.length >= this.maxQueueSize || priority === 'maintenance') {
-      throw modelOverloaded('Model host queue is full or unavailable for this priority.', {
-        activeRequests: this.activeRequests,
-        maxConcurrentRequests: this.maxConcurrentRequests,
-        queueDepth: this.waitQueue.length,
-        maxQueueSize: this.maxQueueSize,
-      });
+    if (this.activeRequests < MODEL_SLOTS) {
+      return Promise.resolve(this.startModelSlot(registrationNumber));
     }
 
     return new Promise((resolve, reject) => {
       const entry: QueueEntry = {
+        registrationNumber,
         priority,
         sequence: this.queueSequence++,
         resolve,
@@ -576,17 +521,34 @@ export class LlmService implements OnModuleInit {
       signal?.addEventListener('abort', abortQueued, { once: true });
 
       this.waitQueue.push(entry);
-      onQueued?.(this.queuePosition(entry));
+      onQueued?.(this.queueEstimate(entry));
     });
   }
 
-  private releaseModelSlot(): void {
+  private startModelSlot(registrationNumber: string): AcquiredModelSlot {
+    const startedAt = Date.now();
+    this.activeRequests += 1;
+    this.currentRegistrationNumber = registrationNumber;
+
+    return {
+      registrationNumber,
+      release: () => this.releaseModelSlot(registrationNumber, startedAt),
+    };
+  }
+
+  private releaseModelSlot(registrationNumber: string, startedAt: number): void {
+    this.recordRequestDuration(Date.now() - startedAt);
+
+    if (this.currentRegistrationNumber === registrationNumber) {
+      this.currentRegistrationNumber = undefined;
+    }
+
     this.activeRequests = Math.max(0, this.activeRequests - 1);
     this.startNextQueuedRequest();
   }
 
   private startNextQueuedRequest(): void {
-    if (this.activeRequests >= this.maxConcurrentRequests || this.waitQueue.length === 0) {
+    if (this.activeRequests >= MODEL_SLOTS || this.waitQueue.length === 0) {
       return;
     }
 
@@ -599,8 +561,7 @@ export class LlmService implements OnModuleInit {
       return;
     }
 
-    this.activeRequests += 1;
-    entry.resolve(() => this.releaseModelSlot());
+    entry.resolve(this.startModelSlot(entry.registrationNumber));
   }
 
   private nextQueueIndex(): number {
@@ -617,6 +578,25 @@ export class LlmService implements OnModuleInit {
     return bestIndex;
   }
 
+  private queueEstimate(entry: QueueEntry): QueueEstimate {
+    const position = this.queuePosition(entry);
+    const averageRequestDurationMs = this.averageRequestDurationMs;
+    const estimatedWaitMs =
+      averageRequestDurationMs !== undefined ? position * averageRequestDurationMs : undefined;
+    const estimatedStartAt =
+      estimatedWaitMs !== undefined
+        ? new Date(Date.now() + estimatedWaitMs).toISOString()
+        : undefined;
+
+    return {
+      registrationNumber: entry.registrationNumber,
+      position,
+      estimatedWaitMs,
+      estimatedStartAt,
+      tryAgainAt: estimatedStartAt,
+    };
+  }
+
   private queuePosition(entry: QueueEntry): number {
     return (
       this.waitQueue
@@ -626,6 +606,28 @@ export class LlmService implements OnModuleInit {
         )
         .indexOf(entry) + 1
     );
+  }
+
+  private recordRequestDuration(durationMs: number): void {
+    this.recentRequestDurationsMs.push(durationMs);
+
+    if (this.recentRequestDurationsMs.length > RECENT_DURATION_SAMPLE_SIZE) {
+      this.recentRequestDurationsMs.shift();
+    }
+  }
+
+  private get averageRequestDurationMs(): number | undefined {
+    if (this.recentRequestDurationsMs.length === 0) {
+      return undefined;
+    }
+
+    const total = this.recentRequestDurationsMs.reduce((sum, value) => sum + value, 0);
+    return Math.round(total / this.recentRequestDurationsMs.length);
+  }
+
+  private nextRegistrationNumber(): string {
+    this.registrationSequence += 1;
+    return `U-${String(this.registrationSequence).padStart(6, '0')}`;
   }
 
   private assertRequestContext(context: RequestContext | undefined): void {
@@ -705,15 +707,6 @@ export class LlmService implements OnModuleInit {
     };
   }
 
-  private get limits(): ModelLimits {
-    return {
-      maxTextChars: this.maxTextChars,
-      maxImages: this.imageInputEnabled ? this.maxImages : 0,
-      maxImageBytes: this.imageInputEnabled ? this.maxImageBytes : 0,
-      maxConcurrentRequests: this.maxConcurrentRequests,
-    };
-  }
-
   private get keepAliveText(): string {
     return formatKeepAlive(this.keepAlive);
   }
@@ -741,20 +734,16 @@ function normalizeResponseFormat(value: unknown): 'text' | 'json' {
   throw validationFailed('options.responseFormat must be text or json.');
 }
 
-function clampInteger(value: unknown, min: number, max: number, fieldName: string): number {
-  if (typeof value !== 'number' || !Number.isInteger(value)) {
-    throw validationFailed(`${fieldName} must be an integer.`);
+function normalizeOllamaOptions(value: unknown): Record<string, unknown> | undefined {
+  if (value === undefined) {
+    return undefined;
   }
 
-  return Math.min(Math.max(value, min), max);
-}
-
-function clampNumber(value: unknown, min: number, max: number, fieldName: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw validationFailed(`${fieldName} must be a number.`);
+  if (!isRecord(value)) {
+    throw validationFailed('options.ollama must be an object.');
   }
 
-  return Math.min(Math.max(value, min), max);
+  return value;
 }
 
 function mapFinishReason(value: string | undefined): 'stop' | 'length' | 'error' {
