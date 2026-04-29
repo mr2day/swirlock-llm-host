@@ -48,6 +48,7 @@ export interface InferenceOptions {
   stopSequences?: string[];
   seed?: number;
   responseFormat?: ResponseFormat;
+  thinking?: boolean;
 }
 
 export interface InferRequest {
@@ -96,6 +97,7 @@ export interface ModelCapacity {
   activeRequests: number;
   maxConcurrentRequests: number;
   queueDepth?: number;
+  maxQueueSize?: number;
 }
 
 export interface HealthData {

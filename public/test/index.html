@@ -7,17 +7,19 @@
     <style>
       :root {
         color-scheme: dark;
-        --bg: #0d1117;
-        --panel: #151b23;
-        --field: #0f141c;
-        --field-soft: #111923;
-        --text: #d7dee8;
-        --muted: #8b98aa;
-        --line: #2a3443;
-        --accent: #4c8df6;
-        --accent-dark: #3274df;
+        --bg: #101114;
+        --surface: #191b20;
+        --surface-2: #20242b;
+        --field: #111318;
+        --line: #343842;
+        --text: #eef1f5;
+        --muted: #a0a7b3;
+        --subtle: #737b8a;
+        --accent: #4fa88a;
+        --accent-strong: #68c7a5;
         --danger: #ff8a80;
-        --ok: #7ee2a8;
+        --warning: #e5bc63;
+        --shadow: rgba(0, 0, 0, 0.32);
       }
 
       * {
@@ -33,279 +35,516 @@
           Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
 
-      main {
-        width: min(1120px, calc(100vw - 32px));
-        margin: 0 auto;
-        padding: 28px 0;
+      button,
+      textarea,
+      input,
+      select {
+        font: inherit;
       }
 
-      header {
+      button {
+        border: 0;
+        color: inherit;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.52;
+      }
+
+      .shell {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        min-height: 100vh;
+      }
+
+      .topbar {
         display: flex;
-        align-items: end;
+        align-items: center;
         justify-content: space-between;
-        gap: 16px;
-        margin-bottom: 16px;
+        gap: 18px;
+        min-height: 56px;
+        padding: 12px 18px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(16, 17, 20, 0.92);
+        backdrop-filter: blur(12px);
+        position: sticky;
+        top: 0;
+        z-index: 5;
       }
 
       h1 {
         margin: 0;
-        font-size: 24px;
+        font-size: 16px;
         font-weight: 680;
+        letter-spacing: 0;
       }
 
       .status {
-        min-height: 24px;
+        min-width: 0;
         color: var(--muted);
-        font-size: 14px;
+        font-size: 13px;
         text-align: right;
+        overflow-wrap: anywhere;
       }
 
       .status.ok {
-        color: var(--ok);
+        color: var(--accent-strong);
       }
 
       .status.error {
         color: var(--danger);
       }
 
-      .grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 16px;
+      .messages {
+        width: min(920px, calc(100vw - 28px));
+        margin: 0 auto;
+        padding: 24px 0 28px;
       }
 
-      section {
-        background: var(--panel);
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        padding: 16px;
-      }
-
-      label {
-        display: block;
-        margin-bottom: 8px;
-        color: var(--muted);
-        font-size: 13px;
-        font-weight: 650;
-        text-transform: uppercase;
-      }
-
-      textarea,
-      input,
-      select {
-        width: 100%;
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        background: var(--field);
-        color: var(--text);
-        font: inherit;
-      }
-
-      textarea {
-        min-height: 220px;
-        padding: 12px;
-        resize: vertical;
-        line-height: 1.45;
-      }
-
-      input,
-      select {
-        height: 38px;
-        padding: 0 10px;
-      }
-
-      .dropzone {
+      .empty-state {
         display: grid;
         place-items: center;
-        min-height: 220px;
-        border: 1px dashed #aab5c8;
-        border-radius: 8px;
-        background: var(--field-soft);
-        overflow: hidden;
-        position: relative;
-      }
-
-      .dropzone.dragging {
-        border-color: var(--accent);
-        background: #172538;
-      }
-
-      .dropzone img {
-        display: none;
-        width: 100%;
-        height: 100%;
-        max-height: 340px;
-        object-fit: contain;
-      }
-
-      .dropzone.has-image img {
-        display: block;
-      }
-
-      .dropzone.has-image .empty {
-        display: none;
-      }
-
-      .empty {
+        min-height: calc(100vh - 260px);
         color: var(--muted);
         text-align: center;
-        padding: 16px;
       }
 
-      .controls {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 12px;
-        margin-top: 12px;
-      }
-
-      .actions {
-        display: flex;
-        justify-content: flex-end;
-        gap: 10px;
-        margin-top: 16px;
-      }
-
-      button {
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        height: 38px;
-        padding: 0 14px;
-        background: var(--field);
+      .empty-state strong {
+        display: block;
+        margin-bottom: 8px;
         color: var(--text);
-        font: inherit;
-        font-weight: 650;
-        cursor: pointer;
+        font-size: 22px;
+        font-weight: 700;
       }
 
-      button.primary {
-        border-color: var(--accent);
-        background: var(--accent);
-        color: #ffffff;
+      .message {
+        display: grid;
+        grid-template-columns: 36px minmax(0, 1fr);
+        gap: 12px;
+        margin: 0 0 22px;
       }
 
-      button.primary:hover {
-        background: var(--accent-dark);
-      }
-
-      button:disabled {
-        cursor: not-allowed;
-        opacity: 0.62;
-      }
-
-      .answer {
-        width: 100%;
-        min-height: 220px;
-        white-space: pre-wrap;
-        line-height: 1.5;
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        padding: 12px;
-        background: var(--field);
-        resize: vertical;
-        overflow: hidden;
-      }
-
-      .meta {
-        margin-top: 10px;
+      .avatar {
+        display: grid;
+        place-items: center;
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
+        background: var(--surface-2);
         color: var(--muted);
+        font-weight: 750;
         font-size: 13px;
+        user-select: none;
+      }
+
+      .message.user .avatar {
+        background: #2a313b;
+        color: var(--text);
+      }
+
+      .message.assistant .avatar {
+        background: #1e3a31;
+        color: var(--accent-strong);
+      }
+
+      .bubble {
+        min-width: 0;
+        width: fit-content;
+        max-width: min(760px, 100%);
+        padding: 12px 14px;
+        border-radius: 8px;
+        border: 1px solid transparent;
+        background: transparent;
+        line-height: 1.55;
+        white-space: pre-wrap;
         overflow-wrap: anywhere;
       }
 
-      .notice {
+      .message.user .bubble {
+        justify-self: end;
+        background: var(--surface-2);
+        border-color: var(--line);
+      }
+
+      .message.assistant .bubble {
+        width: 100%;
+        max-width: 100%;
+        padding-left: 0;
+        padding-right: 0;
+      }
+
+      .text-block {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .thumbnail-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .message .thumbnail-grid {
+        margin-bottom: 2px;
+      }
+
+      .message-thumb {
+        width: 112px;
+        height: 82px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        object-fit: cover;
+        background: var(--field);
+      }
+
+      .thinking-panel {
+        display: none;
+        margin-bottom: 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #15181d;
+        color: var(--muted);
+      }
+
+      .thinking-panel.visible {
+        display: block;
+      }
+
+      .thinking-panel summary {
+        cursor: pointer;
+        padding: 9px 12px;
+        color: var(--warning);
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .thinking-text {
+        max-height: 220px;
+        overflow: auto;
+        border-top: 1px solid var(--line);
+        padding: 10px 12px 12px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .assistant-text {
+        min-height: 28px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .message-meta {
+        margin-top: 10px;
+        color: var(--subtle);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+
+      .message-meta.error {
         color: var(--danger);
       }
 
-      @media (max-width: 820px) {
-        header {
-          align-items: start;
+      .composer-wrap {
+        position: sticky;
+        bottom: 0;
+        z-index: 4;
+        padding: 14px;
+        background: linear-gradient(rgba(16, 17, 20, 0), var(--bg) 22px);
+      }
+
+      .composer {
+        width: min(920px, calc(100vw - 28px));
+        margin: 0 auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        box-shadow: 0 14px 38px var(--shadow);
+      }
+
+      .composer.dragging {
+        border-color: var(--accent);
+      }
+
+      .attachments {
+        display: none;
+        gap: 8px;
+        flex-wrap: wrap;
+        padding: 10px 10px 0;
+      }
+
+      .attachments.visible {
+        display: flex;
+      }
+
+      .attachment {
+        position: relative;
+        width: 86px;
+        height: 68px;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        background: var(--field);
+      }
+
+      .attachment img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .remove-attachment {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        display: grid;
+        place-items: center;
+        width: 22px;
+        height: 22px;
+        border-radius: 999px;
+        background: rgba(7, 9, 12, 0.82);
+        color: var(--text);
+        font-size: 15px;
+        line-height: 1;
+      }
+
+      .input-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: end;
+        padding: 10px;
+      }
+
+      textarea {
+        width: 100%;
+        min-height: 52px;
+        max-height: 210px;
+        resize: none;
+        border: 0;
+        outline: none;
+        background: transparent;
+        color: var(--text);
+        line-height: 1.45;
+        padding: 6px 4px;
+      }
+
+      textarea::placeholder {
+        color: var(--subtle);
+      }
+
+      .send {
+        display: grid;
+        place-items: center;
+        width: 38px;
+        height: 38px;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #06110d;
+        font-size: 18px;
+        font-weight: 800;
+      }
+
+      .send:hover:not(:disabled) {
+        background: var(--accent-strong);
+      }
+
+      .settings {
+        display: grid;
+        grid-template-columns:
+          auto minmax(88px, 130px) minmax(88px, 130px) minmax(88px, 120px)
+          auto auto auto;
+        gap: 8px;
+        align-items: center;
+        padding: 0 10px 10px;
+      }
+
+      .icon-button,
+      .stop,
+      .clear {
+        display: inline-grid;
+        place-items: center;
+        height: 34px;
+        min-width: 34px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--field);
+        color: var(--text);
+        padding: 0 10px;
+      }
+
+      .stop {
+        display: none;
+        color: var(--warning);
+      }
+
+      .stop.visible {
+        display: inline-grid;
+      }
+
+      .clear {
+        color: var(--muted);
+      }
+
+      .setting {
+        display: grid;
+        gap: 4px;
+      }
+
+      .setting label,
+      .check {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      input,
+      select {
+        width: 100%;
+        height: 34px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--field);
+        color: var(--text);
+        padding: 0 9px;
+      }
+
+      .check {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        min-height: 34px;
+        padding: 0 4px;
+        white-space: nowrap;
+      }
+
+      .check input {
+        width: 16px;
+        height: 16px;
+        accent-color: var(--accent);
+      }
+
+      .file-input {
+        display: none;
+      }
+
+      @media (max-width: 760px) {
+        .topbar {
+          align-items: flex-start;
           flex-direction: column;
+          gap: 6px;
         }
 
         .status {
           text-align: left;
         }
 
-        .grid,
-        .controls {
-          grid-template-columns: 1fr;
+        .messages {
+          padding-top: 16px;
+        }
+
+        .message {
+          grid-template-columns: 30px minmax(0, 1fr);
+          gap: 9px;
+        }
+
+        .avatar {
+          width: 30px;
+          height: 30px;
+        }
+
+        .settings {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .settings .icon-button,
+        .settings .clear,
+        .settings .stop,
+        .settings .check {
+          width: 100%;
+          justify-content: center;
         }
       }
     </style>
   </head>
   <body>
-    <main>
-      <header>
+    <div class="shell">
+      <header class="topbar">
         <h1>Utility LLM Test</h1>
         <div id="status" class="status">Checking model status...</div>
       </header>
 
-      <div class="grid">
-        <section>
-          <label for="question">Question</label>
-          <textarea id="question" placeholder="Ask the model something"></textarea>
+      <main id="messages" class="messages">
+        <div id="emptyState" class="empty-state">
+          <div>
+            <strong>Utility LLM</strong>
+            <span>What should I inspect?</span>
+          </div>
+        </div>
+      </main>
 
-          <div class="controls">
-            <div>
-              <label for="tokens">Max Tokens</label>
+      <div class="composer-wrap">
+        <section id="composer" class="composer" aria-label="Message composer">
+          <div id="attachments" class="attachments"></div>
+          <div class="input-row">
+            <textarea id="prompt" rows="1" placeholder="Message the model"></textarea>
+            <button id="send" class="send" type="button" title="Send" aria-label="Send">&gt;</button>
+          </div>
+          <div class="settings">
+            <button id="attach" class="icon-button" type="button" title="Attach image" aria-label="Attach image">
+              +
+            </button>
+            <div class="setting">
+              <label for="tokens">Max tokens</label>
               <input id="tokens" type="number" min="1" max="1024" value="512" />
             </div>
-            <div>
+            <div class="setting">
               <label for="temperature">Temperature</label>
               <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.2" />
             </div>
-            <div>
+            <div class="setting">
               <label for="format">Format</label>
               <select id="format">
                 <option value="text">Text</option>
                 <option value="json">JSON</option>
               </select>
             </div>
+            <label class="check" for="thinking">
+              <input id="thinking" type="checkbox" />
+              Thinking
+            </label>
+            <button id="stop" class="stop" type="button">Stop</button>
+            <button id="clear" class="clear" type="button">Clear</button>
           </div>
-        </section>
-
-        <section>
-          <label for="imageFile">Image</label>
-          <div id="dropzone" class="dropzone" tabindex="0">
-            <div class="empty">Paste, drop, or choose an image</div>
-            <img id="preview" alt="Selected image preview" />
-          </div>
-          <div class="actions">
-            <input id="imageFile" type="file" accept="image/*" />
-            <button id="clearImage" type="button">Clear</button>
-          </div>
+          <input id="file" class="file-input" type="file" accept="image/*" multiple />
         </section>
       </div>
-
-      <section style="margin-top: 16px">
-        <label for="answer">Answer</label>
-        <textarea id="answer" class="answer" readonly></textarea>
-        <div id="meta" class="meta"></div>
-        <div class="actions">
-          <button id="clearAll" type="button">Reset</button>
-          <button id="submit" class="primary" type="button">Run</button>
-        </div>
-      </section>
-    </main>
+    </div>
 
     <script>
-      const question = document.getElementById("question");
-      const tokens = document.getElementById("tokens");
-      const temperature = document.getElementById("temperature");
-      const format = document.getElementById("format");
-      const dropzone = document.getElementById("dropzone");
-      const imageFile = document.getElementById("imageFile");
-      const preview = document.getElementById("preview");
-      const clearImage = document.getElementById("clearImage");
-      const clearAll = document.getElementById("clearAll");
-      const submit = document.getElementById("submit");
-      const answer = document.getElementById("answer");
-      const meta = document.getElementById("meta");
-      const status = document.getElementById("status");
+      const messages = document.getElementById("messages");
+      const emptyState = document.getElementById("emptyState");
+      const statusEl = document.getElementById("status");
+      const composer = document.getElementById("composer");
+      const attachmentsEl = document.getElementById("attachments");
+      const promptEl = document.getElementById("prompt");
+      const sendButton = document.getElementById("send");
+      const attachButton = document.getElementById("attach");
+      const fileInput = document.getElementById("file");
+      const tokensEl = document.getElementById("tokens");
+      const temperatureEl = document.getElementById("temperature");
+      const formatEl = document.getElementById("format");
+      const thinkingEl = document.getElementById("thinking");
+      const stopButton = document.getElementById("stop");
+      const clearButton = document.getElementById("clear");
 
-      let imageDataUrl = "";
-      let imageMimeType = "";
+      const attachments = [];
+      let activeSocket = null;
+      let activeAssistant = null;
+      let thinkingTouched = false;
 
       function correlationId(prefix) {
         const random =
@@ -316,36 +555,303 @@
       }
 
       function setStatus(message, kind = "") {
-        status.textContent = message;
-        status.className = `status ${kind}`.trim();
+        statusEl.textContent = message;
+        statusEl.className = `status ${kind}`.trim();
       }
 
-      function setAnswer(value) {
-        answer.value = value || "";
-        answer.style.height = "auto";
-        answer.style.height = `${Math.max(220, answer.scrollHeight + 4)}px`;
+      function scrollToBottom() {
+        requestAnimationFrame(() => {
+          window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" });
+        });
       }
 
-      function setImage(dataUrl, mimeType) {
-        imageDataUrl = dataUrl;
-        imageMimeType = mimeType;
-        preview.src = dataUrl;
-        dropzone.classList.add("has-image");
+      function autosizePrompt() {
+        promptEl.style.height = "auto";
+        promptEl.style.height = `${Math.min(210, Math.max(52, promptEl.scrollHeight))}px`;
       }
 
-      function resetImage() {
-        imageDataUrl = "";
-        imageMimeType = "";
-        preview.removeAttribute("src");
-        imageFile.value = "";
-        dropzone.classList.remove("has-image");
+      function fileToDataUrl(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            resolve({
+              id: correlationId("image"),
+              dataUrl: String(reader.result),
+              mimeType: file.type || "image/png",
+              name: file.name || "image",
+            });
+          };
+          reader.onerror = () => reject(new Error("Could not read image."));
+          reader.readAsDataURL(file);
+        });
       }
 
-      function readImageFile(file) {
-        if (!file || !file.type.startsWith("image/")) return;
-        const reader = new FileReader();
-        reader.onload = () => setImage(String(reader.result), file.type);
-        reader.readAsDataURL(file);
+      async function addImageFiles(files) {
+        const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
+        if (imageFiles.length === 0) return;
+
+        const loaded = await Promise.all(imageFiles.map(fileToDataUrl));
+        attachments.push(...loaded);
+        renderAttachments();
+      }
+
+      function renderAttachments() {
+        attachmentsEl.textContent = "";
+        attachmentsEl.classList.toggle("visible", attachments.length > 0);
+
+        for (const item of attachments) {
+          const card = document.createElement("div");
+          card.className = "attachment";
+
+          const img = document.createElement("img");
+          img.src = item.dataUrl;
+          img.alt = item.name;
+
+          const remove = document.createElement("button");
+          remove.className = "remove-attachment";
+          remove.type = "button";
+          remove.title = "Remove image";
+          remove.setAttribute("aria-label", "Remove image");
+          remove.textContent = "x";
+          remove.addEventListener("click", () => {
+            const index = attachments.findIndex((candidate) => candidate.id === item.id);
+            if (index >= 0) attachments.splice(index, 1);
+            renderAttachments();
+          });
+
+          card.append(img, remove);
+          attachmentsEl.append(card);
+        }
+      }
+
+      function clearComposer() {
+        promptEl.value = "";
+        attachments.splice(0, attachments.length);
+        fileInput.value = "";
+        renderAttachments();
+        autosizePrompt();
+      }
+
+      function createMessage(role) {
+        emptyState.style.display = "none";
+
+        const row = document.createElement("article");
+        row.className = `message ${role}`;
+
+        const avatar = document.createElement("div");
+        avatar.className = "avatar";
+        avatar.textContent = role === "user" ? "U" : "M";
+
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+
+        row.append(avatar, bubble);
+        messages.append(row);
+
+        return { row, bubble };
+      }
+
+      function appendUserMessage(text, imageItems) {
+        const { bubble } = createMessage("user");
+
+        if (text) {
+          const textBlock = document.createElement("div");
+          textBlock.className = "text-block";
+          textBlock.textContent = text;
+          bubble.append(textBlock);
+        }
+
+        if (imageItems.length > 0) {
+          const grid = document.createElement("div");
+          grid.className = "thumbnail-grid";
+
+          for (const item of imageItems) {
+            const img = document.createElement("img");
+            img.className = "message-thumb";
+            img.src = item.dataUrl;
+            img.alt = item.name;
+            grid.append(img);
+          }
+
+          bubble.append(grid);
+        }
+
+        scrollToBottom();
+      }
+
+      function appendAssistantMessage() {
+        const { bubble } = createMessage("assistant");
+
+        const thinkingPanel = document.createElement("details");
+        thinkingPanel.className = "thinking-panel";
+        thinkingPanel.open = true;
+
+        const summary = document.createElement("summary");
+        summary.textContent = "Thinking";
+
+        const thinkingText = document.createElement("div");
+        thinkingText.className = "thinking-text";
+
+        thinkingPanel.append(summary, thinkingText);
+
+        const answerText = document.createElement("div");
+        answerText.className = "assistant-text";
+
+        const messageMeta = document.createElement("div");
+        messageMeta.className = "message-meta";
+        messageMeta.textContent = "Starting...";
+
+        bubble.append(thinkingPanel, answerText, messageMeta);
+        scrollToBottom();
+
+        return { thinkingPanel, thinkingText, answerText, messageMeta };
+      }
+
+      function buildRequest(text, imageItems) {
+        const parts = [];
+
+        if (text) {
+          parts.push({ type: "text", text });
+        }
+
+        for (const item of imageItems) {
+          parts.push({
+            type: "image",
+            imageBase64: item.dataUrl,
+            mimeType: item.mimeType,
+          });
+        }
+
+        return {
+          requestContext: {
+            callerService: "browser-test",
+            priority: "interactive",
+            requestedAt: new Date().toISOString(),
+          },
+          input: { parts },
+          options: {
+            maxOutputTokens: Number(tokensEl.value || 512),
+            temperature: Number(temperatureEl.value || 0.2),
+            responseFormat: formatEl.value,
+            thinking: thinkingEl.checked,
+          },
+        };
+      }
+
+      function setRunning(value) {
+        sendButton.disabled = value;
+        attachButton.disabled = value;
+        fileInput.disabled = value;
+        stopButton.classList.toggle("visible", value);
+      }
+
+      function connectStream(payload, assistantParts, startedAt) {
+        const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+        const socket = new WebSocket(`${protocol}//${location.host}/v2/infer/stream`);
+        activeSocket = socket;
+
+        socket.addEventListener("open", () => {
+          socket.send(JSON.stringify(payload));
+        });
+
+        socket.addEventListener("message", (event) => {
+          const message = JSON.parse(event.data);
+
+          if (message.type === "accepted") {
+            assistantParts.messageMeta.textContent = "Accepted";
+            return;
+          }
+
+          if (message.type === "queued") {
+            assistantParts.messageMeta.textContent = `Queued: position ${message.data?.position ?? "?"}`;
+            setStatus(`Queued: position ${message.data?.position ?? "?"}`, "");
+            return;
+          }
+
+          if (message.type === "started") {
+            assistantParts.messageMeta.textContent = "Running...";
+            setStatus("Streaming response...", "ok");
+            return;
+          }
+
+          if (message.type === "thinking") {
+            assistantParts.thinkingPanel.classList.add("visible");
+            assistantParts.thinkingText.textContent += message.data?.text || "";
+            assistantParts.thinkingText.scrollTop = assistantParts.thinkingText.scrollHeight;
+            scrollToBottom();
+            return;
+          }
+
+          if (message.type === "token") {
+            assistantParts.answerText.textContent += message.data?.text || "";
+            scrollToBottom();
+            return;
+          }
+
+          if (message.type === "done") {
+            const elapsedMs = Math.round(performance.now() - startedAt);
+            const usage = message.data?.usage || {};
+            const finish = message.data?.finishReason || "stop";
+            const tokenText = `${usage.outputTokens ?? "?"}/${usage.totalTokens ?? "?"}`;
+            assistantParts.messageMeta.textContent = `finish: ${finish} | tokens: ${tokenText} | time: ${(elapsedMs / 1000).toFixed(1)}s | request: ${message.meta?.requestId || ""}`;
+            if (finish === "length") {
+              assistantParts.messageMeta.textContent =
+                `Output hit the token limit. ` + assistantParts.messageMeta.textContent;
+              assistantParts.messageMeta.classList.add("error");
+            }
+            setStatus("Ready", "ok");
+            refreshStatus();
+            return;
+          }
+
+          if (message.type === "error") {
+            assistantParts.messageMeta.textContent = message.error?.message || "Inference failed.";
+            assistantParts.messageMeta.classList.add("error");
+            setStatus(message.error?.message || "Inference failed.", "error");
+          }
+        });
+
+        socket.addEventListener("error", () => {
+          assistantParts.messageMeta.textContent = "WebSocket connection failed.";
+          assistantParts.messageMeta.classList.add("error");
+          setStatus("WebSocket connection failed.", "error");
+        });
+
+        socket.addEventListener("close", () => {
+          if (activeSocket === socket) {
+            activeSocket = null;
+            activeAssistant = null;
+            setRunning(false);
+          }
+        });
+      }
+
+      function sendPrompt() {
+        const text = promptEl.value.trim();
+        const imageItems = attachments.slice();
+
+        if (!text && imageItems.length === 0) {
+          return;
+        }
+
+        if (activeSocket) {
+          return;
+        }
+
+        appendUserMessage(text, imageItems);
+        const assistantParts = appendAssistantMessage();
+        activeAssistant = assistantParts;
+
+        const payload = {
+          type: "infer",
+          correlationId: correlationId("browser-stream"),
+          request: buildRequest(text, imageItems),
+        };
+
+        clearComposer();
+        setRunning(true);
+        setStatus("Connecting...", "");
+        connectStream(payload, assistantParts, performance.now());
       }
 
       async function refreshStatus() {
@@ -355,12 +861,20 @@
           });
           const payload = await response.json();
           if (!response.ok) throw new Error(payload.error?.message || "Status request failed");
-          const ready = payload.data?.ready;
-          const loaded = payload.data?.loaded;
-          const modelId = payload.data?.modelId || "model";
-          const thinking = payload.data?.runtime?.thinkingEnabled ? "thinking on" : "thinking off";
+
+          const data = payload.data || {};
+          const runtime = data.runtime || {};
+          const capacity = data.capacity || {};
+          const modelId = data.modelId || "model";
+          const ready = data.ready && data.loaded;
+          const queue = capacity.queueDepth ? ` | queue ${capacity.queueDepth}` : "";
+          const thinking = runtime.thinkingEnabled ? "default thinking on" : "default thinking off";
+
+          if (!thinkingTouched) {
+            thinkingEl.checked = Boolean(runtime.thinkingEnabled);
+          }
           setStatus(
-            `${modelId}: ${ready && loaded ? "ready" : "not ready"} | ${thinking}`,
+            `${modelId}: ${ready ? "ready" : "not ready"} | ${thinking}${queue}`,
             ready ? "ok" : "error",
           );
         } catch (error) {
@@ -368,117 +882,70 @@
         }
       }
 
-      async function runInference() {
-        const text = question.value.trim();
-        if (!text && !imageDataUrl) {
-          setAnswer("");
-          meta.textContent = "Provide text, an image, or both.";
-          return;
+      attachButton.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", () => {
+        void addImageFiles(fileInput.files);
+        fileInput.value = "";
+      });
+      thinkingEl.addEventListener("change", () => {
+        thinkingTouched = true;
+      });
+      promptEl.addEventListener("input", autosizePrompt);
+      sendButton.addEventListener("click", sendPrompt);
+      clearButton.addEventListener("click", () => {
+        if (activeSocket) return;
+        clearComposer();
+        messages.querySelectorAll(".message").forEach((node) => node.remove());
+        emptyState.style.display = "grid";
+      });
+      stopButton.addEventListener("click", () => {
+        if (activeSocket) {
+          activeSocket.close(1000, "stopped");
+          if (activeAssistant) {
+            activeAssistant.messageMeta.textContent = "Stopped.";
+            activeAssistant.messageMeta.classList.add("error");
+          }
+          setStatus("Stopped.", "");
         }
+      });
 
-        const parts = [];
-        if (text) parts.push({ type: "text", text });
-        if (imageDataUrl) {
-          parts.push({
-            type: "image",
-            imageBase64: imageDataUrl,
-            mimeType: imageMimeType || "image/png",
-          });
+      promptEl.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          sendPrompt();
         }
-
-        const body = {
-          requestContext: {
-            callerService: "browser-test",
-            priority: "interactive",
-            requestedAt: new Date().toISOString(),
-          },
-          input: { parts },
-          options: {
-            maxOutputTokens: Number(tokens.value || 512),
-            temperature: Number(temperature.value || 0.2),
-            responseFormat: format.value,
-          },
-        };
-
-        submit.disabled = true;
-        setAnswer("");
-        meta.textContent = "Running...";
-        const startedAt = performance.now();
-
-        try {
-          const response = await fetch("/v2/infer", {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-correlation-id": correlationId("browser-infer"),
-            },
-            body: JSON.stringify(body),
-          });
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.error?.message || "Inference request failed");
-
-          const elapsedMs = Math.round(performance.now() - startedAt);
-          const finishReason = payload.data?.finishReason || "";
-          const usage = payload.data?.usage || {};
-          setAnswer(payload.data?.output?.text || "");
-          const metaParts = [
-            `model: ${payload.data?.modelId || ""}`,
-            `finish: ${finishReason}`,
-            `tokens: ${usage.outputTokens ?? "?"}/${usage.totalTokens ?? "?"}`,
-            `time: ${(elapsedMs / 1000).toFixed(1)}s`,
-            `request: ${payload.meta?.requestId || ""}`,
-          ];
-          meta.innerHTML =
-            finishReason === "length"
-              ? `<span class="notice">Output hit the token limit. Increase Max Tokens if you need the rest.</span><br>${metaParts.join(" | ")}`
-              : metaParts.join(" | ");
-        } catch (error) {
-          setAnswer("");
-          meta.textContent = error.message || "Inference failed";
-        } finally {
-          submit.disabled = false;
-          refreshStatus();
-        }
-      }
+      });
 
       document.addEventListener("paste", (event) => {
+        const files = [];
         for (const item of event.clipboardData?.items || []) {
           if (item.type.startsWith("image/")) {
-            readImageFile(item.getAsFile());
-            event.preventDefault();
-            break;
+            const file = item.getAsFile();
+            if (file) files.push(file);
           }
+        }
+        if (files.length > 0) {
+          event.preventDefault();
+          void addImageFiles(files);
         }
       });
 
-      dropzone.addEventListener("dragover", (event) => {
+      composer.addEventListener("dragover", (event) => {
         event.preventDefault();
-        dropzone.classList.add("dragging");
+        composer.classList.add("dragging");
       });
 
-      dropzone.addEventListener("dragleave", () => {
-        dropzone.classList.remove("dragging");
+      composer.addEventListener("dragleave", () => {
+        composer.classList.remove("dragging");
       });
 
-      dropzone.addEventListener("drop", (event) => {
+      composer.addEventListener("drop", (event) => {
         event.preventDefault();
-        dropzone.classList.remove("dragging");
-        readImageFile(event.dataTransfer?.files?.[0]);
+        composer.classList.remove("dragging");
+        void addImageFiles(event.dataTransfer?.files);
       });
 
-      imageFile.addEventListener("change", () => readImageFile(imageFile.files?.[0]));
-      clearImage.addEventListener("click", resetImage);
-      clearAll.addEventListener("click", () => {
-        question.value = "";
-        setAnswer("");
-        meta.textContent = "";
-        resetImage();
-      });
-      submit.addEventListener("click", runInference);
-      question.addEventListener("keydown", (event) => {
-        if (event.ctrlKey && event.key === "Enter") runInference();
-      });
-
+      autosizePrompt();
       refreshStatus();
     </script>
   </body>

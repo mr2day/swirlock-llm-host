@@ -17,6 +17,7 @@ module.exports = {
         MODEL_IMAGE_INPUT: 'true',
         MODEL_THINKING: 'false',
         MAX_CONCURRENT_REQUESTS: '1',
+        MAX_QUEUE_SIZE: '8',
       },
     },
   ],

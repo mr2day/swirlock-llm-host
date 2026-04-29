@@ -5,6 +5,8 @@ import { json, static as serveStatic, urlencoded } from 'express';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './http-exception.filter';
+import { LlmService } from './llm/llm.service';
+import { attachLlmWebSocketServer } from './llm/llm.websocket';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
@@ -15,6 +17,7 @@ async function bootstrap() {
   app.use('/test', serveStatic(join(process.cwd(), 'public', 'test'), { index: 'index.html' }));
   app.use(json({ limit: jsonLimit }));
   app.use(urlencoded({ extended: true, limit: jsonLimit }));
+  attachLlmWebSocketServer(app.getHttpServer(), app.get(LlmService));
 
   const port = Number(process.env.PORT ?? 3000);
   const host = process.env.HOST ?? '0.0.0.0';

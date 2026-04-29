@@ -1,5 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { Ollama, type Message, type Options } from 'ollama';
+import { Ollama, type ChatResponse, type Message, type Options } from 'ollama';
 import {
   limitExceeded,
   modelOverloaded,
@@ -40,6 +40,7 @@ interface NormalizedInput {
 
 interface AppliedOptions {
   responseFormat: 'text' | 'json';
+  thinking: boolean;
   publicOptions: InferenceOptions;
   ollamaOptions: Partial<Options>;
 }
@@ -51,6 +52,30 @@ interface RuntimeState {
   version?: string;
   error?: string;
 }
+
+interface QueueEntry {
+  priority: RequestContext['priority'];
+  sequence: number;
+  resolve: (release: () => void) => void;
+  reject: (error: Error) => void;
+  signal?: AbortSignal;
+}
+
+export type StreamEvent =
+  | { type: 'accepted'; meta: ReturnType<typeof createApiMeta> }
+  | { type: 'queued'; meta: ReturnType<typeof createApiMeta>; data: { position: number } }
+  | { type: 'started'; meta: ReturnType<typeof createApiMeta> }
+  | { type: 'thinking'; meta: ReturnType<typeof createApiMeta>; data: { text: string } }
+  | { type: 'token'; meta: ReturnType<typeof createApiMeta>; data: { text: string } }
+  | {
+      type: 'done';
+      meta: ReturnType<typeof createApiMeta>;
+      data: {
+        finishReason: 'stop' | 'length' | 'error';
+        usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+        appliedOptions: InferenceOptions;
+      };
+    };
 
 @Injectable()
 export class LlmService implements OnModuleInit {
@@ -71,9 +96,12 @@ export class LlmService implements OnModuleInit {
   );
   private readonly maxContextTokens = getIntegerEnv('MAX_CONTEXT_TOKENS', 8192);
   private readonly maxConcurrentRequests = getIntegerEnv('MAX_CONCURRENT_REQUESTS', 1);
+  private readonly maxQueueSize = getIntegerEnv('MAX_QUEUE_SIZE', 8);
   private readonly requestTimeoutMs = getIntegerEnv('REQUEST_TIMEOUT_MS', 120000);
   private readonly imageFetchTimeoutMs = getIntegerEnv('IMAGE_FETCH_TIMEOUT_MS', 15000);
   private activeRequests = 0;
+  private queueSequence = 0;
+  private readonly waitQueue: QueueEntry[] = [];
 
   private readonly ollama = new Ollama({
     host: this.ollamaHost,
@@ -102,14 +130,7 @@ export class LlmService implements OnModuleInit {
   async infer(correlationId: string, request: InferRequest): Promise<InferResponse> {
     this.assertRequestContext(request?.requestContext);
 
-    if (this.activeRequests >= this.maxConcurrentRequests) {
-      throw modelOverloaded('Model host is at its configured concurrency limit.', {
-        activeRequests: this.activeRequests,
-        maxConcurrentRequests: this.maxConcurrentRequests,
-      });
-    }
-
-    this.activeRequests += 1;
+    const release = await this.acquireModelSlot(request.requestContext.priority);
 
     try {
       const input = await this.normalizeInput(request);
@@ -127,7 +148,7 @@ export class LlmService implements OnModuleInit {
         messages,
         stream: false,
         keep_alive: this.keepAlive,
-        think: this.thinkingEnabled,
+        think: appliedOptions.thinking,
         options: appliedOptions.ollamaOptions,
         ...(appliedOptions.responseFormat === 'json' ? { format: 'json' } : {}),
       });
@@ -161,7 +182,101 @@ export class LlmService implements OnModuleInit {
     } catch (error) {
       throw this.normalizeUpstreamError(error);
     } finally {
-      this.activeRequests -= 1;
+      release();
+    }
+  }
+
+  async streamInfer(
+    correlationId: string,
+    request: InferRequest,
+    emit: (event: StreamEvent) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    this.assertRequestContext(request?.requestContext);
+
+    const meta = createApiMeta(correlationId);
+    emit({ type: 'accepted', meta });
+
+    const release = await this.acquireModelSlot(
+      request.requestContext.priority,
+      signal,
+      (position) => emit({ type: 'queued', meta, data: { position } }),
+    );
+
+    try {
+      const input = await this.normalizeInput(request);
+      const appliedOptions = this.normalizeOptions(request.options);
+      const messages: Message[] = [
+        {
+          role: 'user',
+          content: input.text,
+          ...(input.images.length > 0 ? { images: input.images } : {}),
+        },
+      ];
+
+      emit({ type: 'started', meta });
+
+      const stream = await this.ollama.chat({
+        model: this.modelId,
+        messages,
+        stream: true,
+        keep_alive: this.keepAlive,
+        think: appliedOptions.thinking,
+        options: appliedOptions.ollamaOptions,
+        ...(appliedOptions.responseFormat === 'json' ? { format: 'json' } : {}),
+      });
+
+      const abortStream = () => stream.abort();
+      signal?.addEventListener('abort', abortStream, { once: true });
+
+      let finalChunk: ChatResponse | undefined;
+
+      try {
+        for await (const chunk of stream) {
+          if (signal?.aborted) {
+            break;
+          }
+
+          finalChunk = chunk;
+
+          if (chunk.message?.thinking) {
+            emit({ type: 'thinking', meta, data: { text: chunk.message.thinking } });
+          }
+
+          if (chunk.message?.content) {
+            emit({ type: 'token', meta, data: { text: chunk.message.content } });
+          }
+        }
+      } finally {
+        signal?.removeEventListener('abort', abortStream);
+      }
+
+      const inputTokens = finalChunk?.prompt_eval_count;
+      const outputTokens = finalChunk?.eval_count;
+
+      emit({
+        type: 'done',
+        meta,
+        data: {
+          finishReason: mapFinishReason(finalChunk?.done_reason),
+          usage:
+            inputTokens !== undefined || outputTokens !== undefined
+              ? {
+                  inputTokens,
+                  outputTokens,
+                  totalTokens:
+                    inputTokens !== undefined && outputTokens !== undefined
+                      ? inputTokens + outputTokens
+                      : undefined,
+                }
+              : undefined,
+          appliedOptions: appliedOptions.publicOptions,
+        },
+      });
+    } catch (error) {
+      throw this.normalizeUpstreamError(error);
+    } finally {
+      release();
     }
   }
 
@@ -192,7 +307,8 @@ export class LlmService implements OnModuleInit {
         capacity: {
           activeRequests: this.activeRequests,
           maxConcurrentRequests: this.maxConcurrentRequests,
-          queueDepth: 0,
+          queueDepth: this.waitQueue.length,
+          maxQueueSize: this.maxQueueSize,
         },
         runtime: {
           ollamaHost: this.ollamaHost,
@@ -426,6 +542,8 @@ export class LlmService implements OnModuleInit {
     }
 
     const responseFormat = normalizeResponseFormat(options?.responseFormat);
+    const thinking =
+      typeof options?.thinking === 'boolean' ? options.thinking : this.thinkingEnabled;
     const maxOutputTokens = clampPositiveInteger(
       options?.maxOutputTokens,
       this.defaultOutputTokens,
@@ -436,6 +554,7 @@ export class LlmService implements OnModuleInit {
     const publicOptions: InferenceOptions = {
       maxOutputTokens,
       responseFormat,
+      thinking,
     };
 
     const ollamaOptions: Partial<Options> = {
@@ -471,9 +590,101 @@ export class LlmService implements OnModuleInit {
 
     return {
       responseFormat,
+      thinking,
       publicOptions,
       ollamaOptions,
     };
+  }
+
+  private acquireModelSlot(
+    priority: RequestContext['priority'],
+    signal?: AbortSignal,
+    onQueued?: (position: number) => void,
+  ): Promise<() => void> {
+    if (this.activeRequests < this.maxConcurrentRequests) {
+      this.activeRequests += 1;
+      return Promise.resolve(() => this.releaseModelSlot());
+    }
+
+    if (this.waitQueue.length >= this.maxQueueSize || priority === 'maintenance') {
+      throw modelOverloaded('Model host queue is full or unavailable for this priority.', {
+        activeRequests: this.activeRequests,
+        maxConcurrentRequests: this.maxConcurrentRequests,
+        queueDepth: this.waitQueue.length,
+        maxQueueSize: this.maxQueueSize,
+      });
+    }
+
+    return new Promise((resolve, reject) => {
+      const entry: QueueEntry = {
+        priority,
+        sequence: this.queueSequence++,
+        resolve,
+        reject,
+        signal,
+      };
+
+      const abortQueued = () => {
+        const index = this.waitQueue.indexOf(entry);
+        if (index >= 0) {
+          this.waitQueue.splice(index, 1);
+          reject(timeout('Queued model request was aborted before it started.'));
+        }
+      };
+
+      signal?.addEventListener('abort', abortQueued, { once: true });
+
+      this.waitQueue.push(entry);
+      onQueued?.(this.queuePosition(entry));
+    });
+  }
+
+  private releaseModelSlot(): void {
+    this.activeRequests = Math.max(0, this.activeRequests - 1);
+    this.startNextQueuedRequest();
+  }
+
+  private startNextQueuedRequest(): void {
+    if (this.activeRequests >= this.maxConcurrentRequests || this.waitQueue.length === 0) {
+      return;
+    }
+
+    const nextIndex = this.nextQueueIndex();
+    const [entry] = this.waitQueue.splice(nextIndex, 1);
+
+    if (entry.signal?.aborted) {
+      entry.reject(timeout('Queued model request was aborted before it started.'));
+      this.startNextQueuedRequest();
+      return;
+    }
+
+    this.activeRequests += 1;
+    entry.resolve(() => this.releaseModelSlot());
+  }
+
+  private nextQueueIndex(): number {
+    let bestIndex = 0;
+
+    for (let index = 1; index < this.waitQueue.length; index += 1) {
+      const candidate = this.waitQueue[index];
+      const best = this.waitQueue[bestIndex];
+      if (priorityRank(candidate.priority) < priorityRank(best.priority)) {
+        bestIndex = index;
+      }
+    }
+
+    return bestIndex;
+  }
+
+  private queuePosition(entry: QueueEntry): number {
+    return (
+      this.waitQueue
+        .slice()
+        .sort(
+          (a, b) => priorityRank(a.priority) - priorityRank(b.priority) || a.sequence - b.sequence,
+        )
+        .indexOf(entry) + 1
+    );
   }
 
   private assertRequestContext(context: RequestContext | undefined): void {
@@ -581,6 +792,16 @@ export class LlmService implements OnModuleInit {
   private get keepAliveText(): string {
     return formatKeepAlive(this.keepAlive);
   }
+}
+
+function priorityRank(priority: RequestContext['priority']): number {
+  if (priority === 'interactive') {
+    return 0;
+  }
+  if (priority === 'background') {
+    return 1;
+  }
+  return 2;
 }
 
 function normalizeResponseFormat(value: unknown): 'text' | 'json' {

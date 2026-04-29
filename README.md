@@ -37,15 +37,19 @@ From another computer on the same Wi-Fi, use:
 http://<this-computer-lan-ip>:3000/test
 ```
 
+The test page uses the streaming WebSocket endpoint. It has a single composer for text plus
+image attachments, removable image thumbnails, a thinking toggle, and live streamed model output.
+
 ## Endpoints
 
 - `POST /v2/infer`
+- `WS /v2/infer/stream`
 - `GET /v2/health`
 - `GET /v2/model/status`
 - `POST /v2/model/preload`
 - `POST /v2/model/unload`
 
-All requests require:
+All HTTP requests require:
 
 ```text
 x-correlation-id: <stable request or turn id>
@@ -73,6 +77,7 @@ Text-only request:
   "options": {
     "temperature": 0.2,
     "maxOutputTokens": 256,
+    "thinking": false,
     "responseFormat": "text"
   }
 }
@@ -130,11 +135,59 @@ Response:
     "appliedOptions": {
       "maxOutputTokens": 256,
       "responseFormat": "text",
+      "thinking": false,
       "temperature": 0.2
     }
   }
 }
 ```
+
+## Streaming Inference
+
+Connect to:
+
+```text
+ws://<host>:3000/v2/infer/stream
+```
+
+Send one JSON message per WebSocket connection:
+
+```json
+{
+  "type": "infer",
+  "correlationId": "example-correlation-id",
+  "request": {
+    "requestContext": {
+      "callerService": "browser-test",
+      "priority": "interactive",
+      "requestedAt": "2026-04-29T12:00:00Z"
+    },
+    "input": {
+      "parts": [{ "type": "text", "text": "Describe what you see." }]
+    },
+    "options": {
+      "maxOutputTokens": 256,
+      "temperature": 0.2,
+      "responseFormat": "text",
+      "thinking": false
+    }
+  }
+}
+```
+
+The server streams JSON events:
+
+- `accepted`
+- `queued`
+- `started`
+- `thinking`
+- `token`
+- `done`
+- `error`
+
+Open multiple WebSocket connections for multiple callers. The host enforces
+`MAX_CONCURRENT_REQUESTS` and queues up to `MAX_QUEUE_SIZE`; extra requests receive a retryable
+`model_overloaded` error.
 
 ## Model Protection
 
@@ -146,6 +199,7 @@ The host enforces:
 - `MAX_OUTPUT_TOKENS`
 - `MAX_CONTEXT_TOKENS`
 - `MAX_CONCURRENT_REQUESTS`
+- `MAX_QUEUE_SIZE`
 - `REQUEST_TIMEOUT_MS`
 - `IMAGE_FETCH_TIMEOUT_MS`
 
