@@ -3,7 +3,7 @@
 
 const env = {
   NODE_ENV: 'production',
-  PORT: '3000',
+  PORT: '3213',
   HOST: '0.0.0.0',
   OLLAMA_HOST: 'http://127.0.0.1:11434',
   OLLAMA_MODELS: 'qwen3.5:9b,gemma4:e4b,qwen2.5-coder:14b',
