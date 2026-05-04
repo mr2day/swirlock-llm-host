@@ -4,7 +4,7 @@
   "description": "LAN-accessible model host server for a local Ollama model.",
   "main": "dist/main.js",
   "scripts": {
-    "build": "nest build",
+    "build": "npx nest build",
     "format": "prettier --write \"src/**/*.ts\" \"*.md\"",
     "start": "node dist/main.js",
     "start:dev": "nest start --watch",
