@@ -2,188 +2,213 @@ import { HttpException, HttpStatus } from '@nestjs/common';
 import type { Server } from 'node:http';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import type { ApiErrorBody } from './api-error';
-import { createApiMeta } from './response-meta';
 import { LlmService, type StreamEvent } from './llm.service';
-import type { InferRequest } from './types';
+import type { InferRequest, ModelLifecycleRequest } from './types';
 
-interface StreamRequestMessage {
-  type: 'infer';
+const MODEL_WS_PATH = '/v4/model';
+
+interface V4Envelope {
+  type: string;
   correlationId: string;
-  request: InferRequest;
+  payload?: unknown;
+  error?: ApiErrorBody;
 }
 
-interface StreamCancelMessage {
-  type: 'cancel';
-  correlationId: string;
-}
-
-type StreamClientMessage = StreamRequestMessage | StreamCancelMessage;
-
-type StreamSocketEvent =
-  | StreamEvent
-  | {
-      type: 'error';
-      meta: ReturnType<typeof createApiMeta>;
-      error: ApiErrorBody;
-    };
-
-type CorrelatedStreamSocketEvent = StreamSocketEvent & { correlationId: string };
+type ActiveRequestMap = Map<string, AbortController>;
 
 export function attachLlmWebSocketServer(server: Server, llmService: LlmService): WebSocketServer {
   const webSocketServer = new WebSocketServer({
     server,
-    path: '/v2/infer/stream',
+    path: MODEL_WS_PATH,
   });
 
   webSocketServer.on('connection', (socket) => {
-    const activeRequests = new Map<string, AbortController>();
+    const activeRequests: ActiveRequestMap = new Map();
 
-    socket.on('close', () => {
-      for (const controller of activeRequests.values()) {
-        controller.abort();
-      }
-      activeRequests.clear();
-    });
-
-    socket.on('error', () => {
-      for (const controller of activeRequests.values()) {
-        controller.abort();
-      }
-      activeRequests.clear();
-    });
-
+    socket.on('close', () => abortAll(activeRequests));
+    socket.on('error', () => abortAll(activeRequests));
     socket.on('message', (data) => {
-      void handleStreamMessage(socket, data, llmService, activeRequests);
+      void handleMessage(socket, data, llmService, activeRequests);
     });
   });
 
   return webSocketServer;
 }
 
-async function handleStreamMessage(
+async function handleMessage(
   socket: WebSocket,
   data: RawData,
   llmService: LlmService,
-  activeRequests: Map<string, AbortController>,
+  activeRequests: ActiveRequestMap,
 ): Promise<void> {
   let correlationId = 'missing-correlation-id';
 
   try {
-    const message = parseStreamMessage(data);
-    correlationId = message.correlationId;
+    const envelope = parseEnvelope(data);
+    correlationId = envelope.correlationId;
 
-    if (message.type === 'cancel') {
+    if (envelope.type === 'heartbeat') {
+      sendEnvelope(socket, {
+        type: 'heartbeat',
+        correlationId,
+        payload: { receivedAt: new Date().toISOString() },
+      });
+      return;
+    }
+
+    if (envelope.type === 'cancel') {
       const active = activeRequests.get(correlationId);
       active?.abort();
       activeRequests.delete(correlationId);
       return;
     }
 
-    if (activeRequests.has(correlationId)) {
-      sendSocketEvent(socket, {
-        type: 'error',
+    if (envelope.type === 'health.get') {
+      const result = await llmService.health(correlationId);
+      sendEnvelope(socket, {
+        type: 'health',
         correlationId,
-        meta: createApiMeta(correlationId),
-        error: validationError(`Inference request ${correlationId} is already active.`),
+        payload: result.data,
       });
+      return;
+    }
+
+    if (envelope.type === 'model.status') {
+      const result = await llmService.modelStatus(correlationId);
+      sendEnvelope(socket, {
+        type: 'model.status',
+        correlationId,
+        payload: result.data,
+      });
+      return;
+    }
+
+    if (envelope.type === 'model.preload') {
+      const result = await llmService.preload(
+        correlationId,
+        requireRequest<ModelLifecycleRequest>(envelope),
+      );
+      sendEnvelope(socket, {
+        type: 'model.preload',
+        correlationId,
+        payload: result.data,
+      });
+      return;
+    }
+
+    if (envelope.type === 'model.unload') {
+      const result = await llmService.unload(
+        correlationId,
+        requireRequest<ModelLifecycleRequest>(envelope),
+      );
+      sendEnvelope(socket, {
+        type: 'model.unload',
+        correlationId,
+        payload: result.data,
+      });
+      return;
+    }
+
+    if (envelope.type !== 'infer') {
+      throw validationException(
+        'WebSocket message type must be infer, health.get, model.status, model.preload, model.unload, cancel, or heartbeat.',
+      );
+    }
+
+    if (activeRequests.has(correlationId)) {
+      sendError(
+        socket,
+        correlationId,
+        validationError(`Inference request ${correlationId} is already active.`),
+      );
       return;
     }
 
     const abortController = new AbortController();
     activeRequests.set(correlationId, abortController);
 
-    await llmService.streamInfer(
-      correlationId,
-      message.request,
-      (event) => sendSocketEvent(socket, withCorrelationId(event, correlationId)),
-      abortController.signal,
-    );
+    try {
+      await llmService.streamInfer(
+        correlationId,
+        requireRequest<InferRequest>(envelope),
+        (event) => sendEnvelope(socket, toEnvelope(event, correlationId)),
+        abortController.signal,
+      );
+    } finally {
+      activeRequests.delete(correlationId);
+    }
   } catch (error) {
-    sendSocketEvent(socket, {
-      type: 'error',
-      correlationId,
-      meta: createApiMeta(correlationId),
-      error: normalizeError(error),
-    });
-  } finally {
-    activeRequests.delete(correlationId);
+    sendError(socket, correlationId, normalizeError(error));
   }
 }
 
-function parseStreamMessage(data: RawData): StreamClientMessage {
+function parseEnvelope(data: RawData): V4Envelope {
   let parsed: unknown;
 
   try {
     parsed = JSON.parse(data.toString('utf8'));
   } catch {
-    throw new HttpException(
-      {
-        error: validationError('WebSocket message must be valid JSON.'),
-      },
-      HttpStatus.BAD_REQUEST,
-    );
+    throw validationException('WebSocket message must be valid JSON.');
   }
 
   if (!isRecord(parsed)) {
-    throw new HttpException(
-      {
-        error: validationError('WebSocket message must be an object.'),
-      },
-      HttpStatus.BAD_REQUEST,
-    );
+    throw validationException('WebSocket message must be an object.');
   }
 
-  if (parsed.type !== 'infer' && parsed.type !== 'cancel') {
-    throw new HttpException(
-      {
-        error: validationError('WebSocket message type must be infer or cancel.'),
-      },
-      HttpStatus.BAD_REQUEST,
-    );
+  if (typeof parsed.type !== 'string' || !parsed.type.trim()) {
+    throw validationException('type is required.');
   }
 
   if (typeof parsed.correlationId !== 'string' || !parsed.correlationId.trim()) {
-    throw new HttpException(
-      {
-        error: validationError('correlationId is required.'),
-      },
-      HttpStatus.BAD_REQUEST,
-    );
-  }
-
-  if (parsed.type === 'cancel') {
-    return {
-      type: 'cancel',
-      correlationId: parsed.correlationId.trim(),
-    };
-  }
-
-  if (!isRecord(parsed.request)) {
-    throw new HttpException(
-      {
-        error: validationError('request is required.'),
-      },
-      HttpStatus.BAD_REQUEST,
-    );
+    throw validationException('correlationId is required.');
   }
 
   return {
-    type: 'infer',
+    type: parsed.type.trim(),
     correlationId: parsed.correlationId.trim(),
-    request: parsed.request as unknown as InferRequest,
+    payload: isRecord(parsed.payload) ? parsed.payload : undefined,
   };
 }
 
-function sendSocketEvent(socket: WebSocket, event: CorrelatedStreamSocketEvent): void {
-  if (socket.readyState !== WebSocket.OPEN) {
-    return;
+function requireRequest<T>(envelope: V4Envelope): T {
+  if (!isRecord(envelope.payload) || !isRecord(envelope.payload.request)) {
+    throw validationException('payload.request is required.');
   }
 
-  socket.send(JSON.stringify(event));
+  return envelope.payload.request as T;
 }
 
-function withCorrelationId(event: StreamEvent, correlationId: string): CorrelatedStreamSocketEvent {
-  return { ...event, correlationId };
+function toEnvelope(event: StreamEvent, correlationId: string): V4Envelope {
+  if ('data' in event && isRecord(event.data)) {
+    return { type: event.type, correlationId, payload: event.data };
+  }
+
+  return { type: event.type, correlationId, payload: {} };
+}
+
+function sendEnvelope(socket: WebSocket, envelope: V4Envelope): void {
+  if (socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify(envelope));
+}
+
+function sendError(socket: WebSocket, correlationId: string, error: ApiErrorBody): void {
+  sendEnvelope(socket, { type: 'error', correlationId, error });
+}
+
+function abortAll(activeRequests: ActiveRequestMap): void {
+  for (const controller of activeRequests.values()) {
+    controller.abort();
+  }
+  activeRequests.clear();
+}
+
+function validationException(message: string): HttpException {
+  return new HttpException(
+    {
+      error: validationError(message),
+    },
+    HttpStatus.BAD_REQUEST,
+  );
 }
 
 function normalizeError(error: unknown): ApiErrorBody {
@@ -227,15 +252,9 @@ function validationError(message: string): ApiErrorBody {
 }
 
 function fallbackCode(status: number): ApiErrorBody['code'] {
-  if (status === HttpStatus.BAD_REQUEST) {
-    return 'bad_request';
-  }
-  if (status === HttpStatus.PAYLOAD_TOO_LARGE) {
-    return 'limit_exceeded';
-  }
-  if (status >= 500) {
-    return 'internal_error';
-  }
+  if (status === HttpStatus.BAD_REQUEST) return 'bad_request';
+  if (status === HttpStatus.PAYLOAD_TOO_LARGE) return 'limit_exceeded';
+  if (status >= 500) return 'internal_error';
   return 'validation_failed';
 }
 

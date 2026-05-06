@@ -5,7 +5,7 @@ export function createApiMeta(correlationId: string): ApiMeta {
   return {
     requestId: randomUUID(),
     correlationId,
-    apiVersion: 'v2',
+    apiVersion: 'v4',
     servedAt: new Date().toISOString(),
   };
 }

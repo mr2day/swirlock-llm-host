@@ -1,30 +1,21 @@
 import 'reflect-metadata';
 import './env';
-import { join } from 'node:path';
-import { json, static as serveStatic, urlencoded } from 'express';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import { HttpExceptionFilter } from './http-exception.filter';
 import { LlmService } from './llm/llm.service';
 import { attachLlmWebSocketServer } from './llm/llm.websocket';
 import { getRequiredStringEnv } from './llm/runtime';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { bodyParser: false });
-  const jsonLimit = getRequiredStringEnv('JSON_BODY_LIMIT');
+  const app = await NestFactory.create(AppModule);
 
-  app.useGlobalFilters(new HttpExceptionFilter());
-  app.enableCors({ origin: true });
-  app.use('/test', serveStatic(join(process.cwd(), 'public', 'test'), { index: 'index.html' }));
-  app.use(json({ limit: jsonLimit }));
-  app.use(urlencoded({ extended: true, limit: jsonLimit }));
   attachLlmWebSocketServer(app.getHttpServer(), app.get(LlmService));
 
   const port = parsePort(getRequiredStringEnv('PORT'));
   const host = getRequiredStringEnv('HOST');
 
   await app.listen(port, host);
-  console.log(`Swirlock LLM Host listening on http://${host}:${port}`);
+  console.log(`Swirlock LLM Host listening for WS on ws://${host}:${port}/v4/model`);
 }
 
 void bootstrap();

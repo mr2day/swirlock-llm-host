@@ -5,7 +5,7 @@ export type ModelLifecycleStatus = 'loading' | 'loaded' | 'unloading' | 'unloade
 export interface ApiMeta {
   requestId: string;
   correlationId: string;
-  apiVersion: 'v2';
+  apiVersion: 'v4';
   servedAt: string;
 }
 
