@@ -35,8 +35,22 @@ export interface ImageInputPart {
 
 export type InputPart = TextInputPart | ImageInputPart;
 
+export interface InferenceMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
 export interface InferenceInput {
-  parts: InputPart[];
+  /**
+   * Legacy flat input. When `messages` is omitted, text parts are joined into
+   * one user message and image parts are attached to it.
+   */
+  parts?: InputPart[];
+  /**
+   * Chat-shaped input for callers that need to preserve system/context/user
+   * boundaries. This maps directly to Ollama chat messages.
+   */
+  messages?: InferenceMessage[];
 }
 
 export interface InferenceOptions {

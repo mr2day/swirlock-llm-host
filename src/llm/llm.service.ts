@@ -27,8 +27,7 @@ const RECENT_DURATION_SAMPLE_SIZE = 20;
 const LOWEST_PRIORITY = Number.NEGATIVE_INFINITY;
 
 interface NormalizedInput {
-  text: string;
-  images: string[];
+  messages: Message[];
 }
 
 interface AppliedOptions {
@@ -146,19 +145,12 @@ export class LlmService implements OnModuleInit {
     try {
       const input = await this.normalizeInput(request);
       const appliedOptions = this.normalizeOptions(request.options);
-      const messages: Message[] = [
-        {
-          role: 'user',
-          content: input.text,
-          ...(input.images.length > 0 ? { images: input.images } : {}),
-        },
-      ];
 
       emit({ type: 'started', meta });
 
       const stream = await this.ollama.chat({
         model: this.modelId,
-        messages,
+        messages: input.messages,
         stream: true,
         keep_alive: this.keepAlive,
         think: appliedOptions.thinking,
@@ -305,42 +297,108 @@ export class LlmService implements OnModuleInit {
   }
 
   private async normalizeInput(request: InferRequest): Promise<NormalizedInput> {
-    if (!isRecord(request?.input) || !Array.isArray(request.input.parts)) {
-      throw validationFailed('input.parts must be a non-empty array.');
+    if (!isRecord(request?.input)) {
+      throw validationFailed('input must be an object.');
     }
 
-    if (request.input.parts.length === 0) {
-      throw validationFailed('input.parts must contain at least one part.');
+    const parts = Array.isArray(request.input.parts) ? request.input.parts : undefined;
+    const rawMessages = Array.isArray(request.input.messages) ? request.input.messages : undefined;
+    if (!parts && !rawMessages) {
+      throw validationFailed('input.parts or input.messages must be a non-empty array.');
     }
 
+    const messages: Message[] = rawMessages ? this.normalizeMessages(rawMessages) : [];
     const textParts: string[] = [];
     const images: string[] = [];
 
-    for (const [index, part] of request.input.parts.entries()) {
-      if (!isRecord(part)) {
-        throw validationFailed(`input.parts[${index}] must be an object.`);
+    if (parts) {
+      if (parts.length === 0 && !rawMessages) {
+        throw validationFailed('input.parts must contain at least one part.');
       }
 
-      if (part.type === 'text') {
-        textParts.push(this.normalizeTextPart(part as InputPart, index));
-        continue;
-      }
+      for (const [index, part] of parts.entries()) {
+        if (!isRecord(part)) {
+          throw validationFailed(`input.parts[${index}] must be an object.`);
+        }
 
-      if (part.type === 'image') {
-        images.push(await this.normalizeImagePart(part as ImageInputPart, index));
-        continue;
-      }
+        if (part.type === 'text') {
+          textParts.push(this.normalizeTextPart(part as unknown as InputPart, index));
+          continue;
+        }
 
-      throw validationFailed(`input.parts[${index}].type must be text or image.`);
+        if (part.type === 'image') {
+          images.push(await this.normalizeImagePart(part as unknown as ImageInputPart, index));
+          continue;
+        }
+
+        throw validationFailed(`input.parts[${index}].type must be text or image.`);
+      }
     }
 
     const text = textParts.join('\n\n').trim();
+
+    if (rawMessages) {
+      if (text) {
+        messages.push({ role: 'user', content: text });
+      }
+      if (images.length > 0) {
+        this.attachImagesToLastUserMessage(messages, images);
+      }
+      if (messages.length === 0) {
+        throw validationFailed('input.messages must contain at least one message.');
+      }
+      return { messages };
+    }
 
     if (!text && images.length === 0) {
       throw validationFailed('Inference input must include text, images, or both.');
     }
 
-    return { text, images };
+    return {
+      messages: [
+        {
+          role: 'user',
+          content: text,
+          ...(images.length > 0 ? { images } : {}),
+        },
+      ],
+    };
+  }
+
+  private normalizeMessages(value: unknown): Message[] {
+    if (!Array.isArray(value)) {
+      throw validationFailed('input.messages must be an array.');
+    }
+
+    if (value.length === 0) return [];
+
+    return value.map((message, index) => {
+      if (!isRecord(message)) {
+        throw validationFailed(`input.messages[${index}] must be an object.`);
+      }
+
+      const role = message.role;
+      if (role !== 'system' && role !== 'user' && role !== 'assistant') {
+        throw validationFailed(`input.messages[${index}].role must be system, user, or assistant.`);
+      }
+
+      if (typeof message.content !== 'string' || !message.content.trim()) {
+        throw validationFailed(`input.messages[${index}].content must be a non-empty string.`);
+      }
+
+      return { role, content: message.content };
+    });
+  }
+
+  private attachImagesToLastUserMessage(messages: Message[], images: string[]): void {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'user') continue;
+      (message as Message & { images?: string[] }).images = images;
+      return;
+    }
+
+    throw validationFailed('Image parts require at least one user message.');
   }
 
   private normalizeTextPart(part: InputPart, index: number): string {
