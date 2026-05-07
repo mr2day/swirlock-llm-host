@@ -609,8 +609,12 @@
       const clearButton = document.getElementById("clear");
 
       const attachments = [];
-      let activeSocket = null;
-      let activeAssistant = null;
+      let modelSocket = null;
+      let socketOpenPromise = null;
+      const inflightAssistants = new Map();
+      const pendingStatusRequests = new Map();
+      let activeRequestCorrelationId = null;
+      let reconnectTimer = null;
       let thinkingTouched = false;
 
       function correlationId(prefix) {
@@ -821,123 +825,229 @@
         stopButton.classList.toggle("visible", value);
       }
 
-      function connectStream(payload, assistantParts) {
-        const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-        const socket = new WebSocket(`${protocol}//${location.host}/v2/infer/stream`);
-        activeSocket = socket;
+      function openModelSocket() {
+        if (
+          modelSocket &&
+          (modelSocket.readyState === WebSocket.OPEN ||
+            modelSocket.readyState === WebSocket.CONNECTING)
+        ) {
+          return;
+        }
 
-        socket.addEventListener("open", () => {
-          socket.send(JSON.stringify(payload));
+        const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+        const socket = new WebSocket(`${protocol}//${location.host}/v4/model`);
+        modelSocket = socket;
+
+        socketOpenPromise = new Promise((resolve, reject) => {
+          socket.addEventListener(
+            "open",
+            () => {
+              setStatus("Connected", "ok");
+              resolve();
+              void refreshStatus();
+            },
+            { once: true },
+          );
+
+          socket.addEventListener(
+            "close",
+            () => {
+              if (socket.readyState !== WebSocket.OPEN) {
+                reject(new Error("WebSocket closed before opening."));
+              }
+            },
+            { once: true },
+          );
         });
 
         socket.addEventListener("message", (event) => {
-          const message = JSON.parse(event.data);
-
-          if (message.type === "accepted") {
-            assistantParts.messageMeta.textContent = "Accepted";
+          let envelope;
+          try {
+            envelope = JSON.parse(event.data);
+          } catch {
             return;
           }
-
-          if (message.type === "queued") {
-            const estimate = message.data?.estimatedStartAt
-              ? ` | estimated start ${new Date(message.data.estimatedStartAt).toLocaleTimeString()}`
-              : "";
-            const ahead =
-              message.data?.requestsAhead !== undefined
-                ? ` | requests ahead ${message.data.requestsAhead}`
-                : "";
-            assistantParts.messageMeta.textContent = `Queued: position ${message.data?.position ?? "?"}${ahead}${estimate}`;
-            setStatus(`Queued: position ${message.data?.position ?? "?"}${ahead}${estimate}`, "");
-            return;
-          }
-
-          if (message.type === "started") {
-            assistantParts.messageMeta.textContent = "Running...";
-            setStatus("Streaming response...", "ok");
-            return;
-          }
-
-          if (message.type === "thinking") {
-            assistantParts.thinkingPanel.classList.add("visible");
-            assistantParts.thinkingText.textContent += message.data?.text || "";
-            assistantParts.thinkingText.scrollTop = assistantParts.thinkingText.scrollHeight;
-            scrollToBottom();
-            return;
-          }
-
-          if (message.type === "chunk") {
-            assistantParts.answerText.textContent += message.data?.text || "";
-            scrollToBottom();
-            return;
-          }
-
-          if (message.type === "done") {
-            const finish = message.data?.finishReason || "stop";
-            assistantParts.messageMeta.textContent = `finish: ${finish} | request: ${message.meta?.requestId || ""}`;
-            setStatus("Ready", "ok");
-            refreshStatus();
-            return;
-          }
-
-          if (message.type === "error") {
-            assistantParts.messageMeta.textContent = message.error?.message || "Inference failed.";
-            assistantParts.messageMeta.classList.add("error");
-            setStatus(message.error?.message || "Inference failed.", "error");
-          }
-        });
-
-        socket.addEventListener("error", () => {
-          assistantParts.messageMeta.textContent = "WebSocket connection failed.";
-          assistantParts.messageMeta.classList.add("error");
-          setStatus("WebSocket connection failed.", "error");
+          handleEnvelope(envelope);
         });
 
         socket.addEventListener("close", () => {
-          if (activeSocket === socket) {
-            activeSocket = null;
-            activeAssistant = null;
-            setRunning(false);
+          for (const parts of inflightAssistants.values()) {
+            parts.messageMeta.textContent = "Connection lost.";
+            parts.messageMeta.classList.add("error");
+          }
+          inflightAssistants.clear();
+
+          for (const pending of pendingStatusRequests.values()) {
+            pending.reject(new Error("WebSocket closed before status response."));
+          }
+          pendingStatusRequests.clear();
+
+          activeRequestCorrelationId = null;
+          setRunning(false);
+
+          if (modelSocket === socket) {
+            modelSocket = null;
+            socketOpenPromise = null;
+            setStatus("Disconnected -- reconnecting...", "error");
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(openModelSocket, 1500);
           }
         });
       }
 
-      function sendPrompt() {
+      async function ensureSocketOpen() {
+        if (!modelSocket || modelSocket.readyState === WebSocket.CLOSED) {
+          openModelSocket();
+        }
+        if (modelSocket.readyState === WebSocket.OPEN) return;
+        await socketOpenPromise;
+      }
+
+      function handleEnvelope(envelope) {
+        if (!envelope || typeof envelope !== "object") return;
+        const cid = envelope.correlationId;
+
+        const pendingStatus = pendingStatusRequests.get(cid);
+        if (pendingStatus) {
+          if (envelope.type === "model.status") {
+            pendingStatusRequests.delete(cid);
+            pendingStatus.resolve(envelope.payload || {});
+            return;
+          }
+          if (envelope.type === "error") {
+            pendingStatusRequests.delete(cid);
+            pendingStatus.reject(
+              new Error(envelope.error?.message || "Status request failed."),
+            );
+            return;
+          }
+        }
+
+        const parts = inflightAssistants.get(cid);
+        if (!parts) return;
+
+        if (envelope.type === "accepted") {
+          parts.messageMeta.textContent = "Accepted";
+          return;
+        }
+
+        if (envelope.type === "queued") {
+          const p = envelope.payload || {};
+          const estimate = p.estimatedStartAt
+            ? ` | estimated start ${new Date(p.estimatedStartAt).toLocaleTimeString()}`
+            : "";
+          const ahead =
+            p.requestsAhead !== undefined ? ` | requests ahead ${p.requestsAhead}` : "";
+          const message = `Queued: position ${p.position ?? "?"}${ahead}${estimate}`;
+          parts.messageMeta.textContent = message;
+          setStatus(message, "");
+          return;
+        }
+
+        if (envelope.type === "started") {
+          parts.messageMeta.textContent = "Running...";
+          setStatus("Streaming response...", "ok");
+          return;
+        }
+
+        if (envelope.type === "thinking") {
+          parts.thinkingPanel.classList.add("visible");
+          parts.thinkingText.textContent += envelope.payload?.text || "";
+          parts.thinkingText.scrollTop = parts.thinkingText.scrollHeight;
+          scrollToBottom();
+          return;
+        }
+
+        if (envelope.type === "chunk") {
+          parts.answerText.textContent += envelope.payload?.text || "";
+          scrollToBottom();
+          return;
+        }
+
+        if (envelope.type === "done") {
+          const finish = envelope.payload?.finishReason || "stop";
+          parts.messageMeta.textContent = `finish: ${finish}`;
+          inflightAssistants.delete(cid);
+          if (activeRequestCorrelationId === cid) activeRequestCorrelationId = null;
+          setRunning(false);
+          setStatus("Ready", "ok");
+          void refreshStatus();
+          return;
+        }
+
+        if (envelope.type === "error") {
+          parts.messageMeta.textContent = envelope.error?.message || "Inference failed.";
+          parts.messageMeta.classList.add("error");
+          setStatus(envelope.error?.message || "Inference failed.", "error");
+          inflightAssistants.delete(cid);
+          if (activeRequestCorrelationId === cid) activeRequestCorrelationId = null;
+          setRunning(false);
+        }
+      }
+
+      async function sendPrompt() {
         const text = promptEl.value.trim();
         const imageItems = attachments.slice();
 
-        if (!text && imageItems.length === 0) {
-          return;
-        }
-
-        if (activeSocket) {
-          return;
-        }
+        if (!text && imageItems.length === 0) return;
+        if (activeRequestCorrelationId) return;
 
         appendUserMessage(text, imageItems);
         const assistantParts = appendAssistantMessage();
-        activeAssistant = assistantParts;
 
-        const payload = {
-          type: "infer",
-          correlationId: correlationId("browser-stream"),
-          request: buildRequest(text, imageItems),
-        };
+        const cid = correlationId("browser-stream");
+        activeRequestCorrelationId = cid;
+        inflightAssistants.set(cid, assistantParts);
 
         clearComposer();
         setRunning(true);
         setStatus("Connecting...", "");
-        connectStream(payload, assistantParts);
+
+        try {
+          await ensureSocketOpen();
+          modelSocket.send(
+            JSON.stringify({
+              type: "infer",
+              correlationId: cid,
+              payload: { request: buildRequest(text, imageItems) },
+            }),
+          );
+        } catch (error) {
+          assistantParts.messageMeta.textContent = error.message || "WebSocket connection failed.";
+          assistantParts.messageMeta.classList.add("error");
+          setStatus("WebSocket connection failed.", "error");
+          inflightAssistants.delete(cid);
+          if (activeRequestCorrelationId === cid) activeRequestCorrelationId = null;
+          setRunning(false);
+        }
       }
 
       async function refreshStatus() {
         try {
-          const response = await fetch("/v2/model/status", {
-            headers: { "x-correlation-id": correlationId("browser-status") },
-          });
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.error?.message || "Status request failed");
+          await ensureSocketOpen();
 
-          const data = payload.data || {};
+          const cid = correlationId("browser-status");
+          const data = await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              if (pendingStatusRequests.delete(cid)) {
+                reject(new Error("Status request timed out."));
+              }
+            }, 5000);
+
+            pendingStatusRequests.set(cid, {
+              resolve: (value) => {
+                clearTimeout(timeout);
+                resolve(value);
+              },
+              reject: (error) => {
+                clearTimeout(timeout);
+                reject(error);
+              },
+            });
+
+            modelSocket.send(JSON.stringify({ type: "model.status", correlationId: cid }));
+          });
+
           const runtime = data.runtime || {};
           const capacity = data.capacity || {};
           const modelId = data.modelId || "model";
@@ -969,20 +1079,26 @@
       promptEl.addEventListener("input", autosizePrompt);
       sendButton.addEventListener("click", sendPrompt);
       clearButton.addEventListener("click", () => {
-        if (activeSocket) return;
+        if (activeRequestCorrelationId) return;
         clearComposer();
         messages.querySelectorAll(".message").forEach((node) => node.remove());
         emptyState.style.display = "grid";
       });
       stopButton.addEventListener("click", () => {
-        if (activeSocket) {
-          activeSocket.close(1000, "stopped");
-          if (activeAssistant) {
-            activeAssistant.messageMeta.textContent = "Stopped.";
-            activeAssistant.messageMeta.classList.add("error");
-          }
-          setStatus("Stopped.", "");
+        const cid = activeRequestCorrelationId;
+        if (!cid || modelSocket?.readyState !== WebSocket.OPEN) return;
+
+        modelSocket.send(JSON.stringify({ type: "cancel", correlationId: cid }));
+
+        const parts = inflightAssistants.get(cid);
+        if (parts) {
+          parts.messageMeta.textContent = "Stopped.";
+          parts.messageMeta.classList.add("error");
         }
+        inflightAssistants.delete(cid);
+        activeRequestCorrelationId = null;
+        setRunning(false);
+        setStatus("Stopped.", "");
       });
 
       promptEl.addEventListener("keydown", (event) => {
@@ -1022,7 +1138,7 @@
       });
 
       autosizePrompt();
-      refreshStatus();
+      openModelSocket();
     </script>
   </body>
 </html>

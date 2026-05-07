@@ -1,5 +1,7 @@
 import 'reflect-metadata';
 import './env';
+import { join } from 'node:path';
+import { static as serveStatic } from 'express';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { LlmService } from './llm/llm.service';
@@ -9,6 +11,8 @@ import { getRequiredStringEnv } from './llm/runtime';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
+  app.use('/test', serveStatic(join(process.cwd(), 'public', 'test'), { index: 'index.html' }));
+
   attachLlmWebSocketServer(app.getHttpServer(), app.get(LlmService));
 
   const port = parsePort(getRequiredStringEnv('PORT'));
@@ -16,6 +20,7 @@ async function bootstrap() {
 
   await app.listen(port, host);
   console.log(`Swirlock LLM Host listening for WS on ws://${host}:${port}/v4/model`);
+  console.log(`Test UI available at http://${host}:${port}/test/`);
 }
 
 void bootstrap();
