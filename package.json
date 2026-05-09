@@ -1,6 +1,6 @@
 {
   "name": "swirlock-llm-host",
-  "version": "1.0.0",
+  "version": "5.0.0",
   "description": "LAN-accessible model host server for a local Ollama model.",
   "main": "dist/main.js",
   "scripts": {
