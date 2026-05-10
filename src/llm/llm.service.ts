@@ -491,8 +491,13 @@ export class LlmService implements OnModuleInit {
     }
 
     const responseFormat = normalizeResponseFormat(options?.responseFormat);
-    const thinking =
+    // Caller may request thinking, but the configured model has to actually
+    // support it. If MODEL_THINKING=false, forward `think: false` to Ollama
+    // regardless of the request — otherwise Ollama errors out for non-thinking
+    // models (e.g. gemma3:12b returns "Ollama request failed").
+    const thinkingRequested =
       typeof options?.thinking === 'boolean' ? options.thinking : this.thinkingEnabled;
+    const thinking = this.thinkingEnabled && thinkingRequested;
     const ollamaOptions = normalizeOllamaOptions(options?.ollama);
 
     const publicOptions: InferenceOptions = {
