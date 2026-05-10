@@ -148,6 +148,15 @@ export class LlmService implements OnModuleInit {
 
       emit({ type: 'started', meta });
 
+      console.log(
+        '===== OLLAMA CALL =====\n' +
+          'model: ' + this.modelId + '\n' +
+          'think: ' + appliedOptions.thinking + '\n' +
+          'options: ' + JSON.stringify(appliedOptions.ollamaOptions) + '\n' +
+          'format: ' + (appliedOptions.responseFormat === 'json' ? 'json' : '(none)') + '\n' +
+          '=======================',
+      );
+
       const stream = await this.ollama.chat({
         model: this.modelId,
         messages: input.messages,
