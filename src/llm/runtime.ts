@@ -36,6 +36,39 @@ export function getRequiredBooleanEnv(name: string): boolean {
   throw new Error(`${name} must be a boolean value in host.config.cjs.`);
 }
 
+export function getRequiredPositiveIntegerEnv(name: string): number {
+  const raw = getRequiredStringEnv(name);
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    throw new Error(
+      `${name} must be a positive integer in host.config.cjs. Received "${raw}".`,
+    );
+  }
+  return parsed;
+}
+
+export function getRequiredPositiveNumberEnv(name: string): number {
+  const raw = getRequiredStringEnv(name);
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(
+      `${name} must be a positive number in host.config.cjs. Received "${raw}".`,
+    );
+  }
+  return parsed;
+}
+
+export function getRequiredFractionEnv(name: string): number {
+  const raw = getRequiredStringEnv(name);
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed >= 1) {
+    throw new Error(
+      `${name} must be a number strictly between 0 and 1 in host.config.cjs. Received "${raw}".`,
+    );
+  }
+  return parsed;
+}
+
 export function parseKeepAlive(value: string): string | number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : value;

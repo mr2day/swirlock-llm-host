@@ -2,8 +2,17 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Ollama, type ChatResponse, type Message, type Options } from 'ollama';
 import { upstreamUnavailable, validationFailed } from './api-error';
 import {
+  computeTargetNumCtx,
+  extractArchitectureFromModelInfo,
+  type ContextWindowComputation,
+  type HardwareSpec,
+} from './context-window';
+import {
   formatKeepAlive,
   getRequiredBooleanEnv,
+  getRequiredFractionEnv,
+  getRequiredPositiveIntegerEnv,
+  getRequiredPositiveNumberEnv,
   getRequiredStringEnv,
   getRequiredStringListEnv,
   parseKeepAlive,
@@ -103,6 +112,29 @@ export class LlmService implements OnModuleInit {
   private readonly preloadModel = getRequiredBooleanEnv('PRELOAD_MODEL');
   private readonly imageInputEnabled = getRequiredBooleanEnv('MODEL_IMAGE_INPUT');
   private readonly thinkingEnabled = getRequiredBooleanEnv('MODEL_THINKING');
+  private readonly hardware: HardwareSpec = {
+    totalVramBytes: getRequiredPositiveIntegerEnv('HARDWARE_TOTAL_VRAM_BYTES'),
+    overheadReserveBytes: getRequiredPositiveIntegerEnv(
+      'HARDWARE_OVERHEAD_RESERVE_BYTES',
+    ),
+    kvCacheElementBytes: getRequiredPositiveNumberEnv(
+      'HARDWARE_KV_CACHE_ELEMENT_BYTES',
+    ),
+  };
+  private readonly promptBudgetFraction = getRequiredFractionEnv(
+    'PROMPT_BUDGET_FRACTION',
+  );
+  private readonly defaultNumCtx = getRequiredPositiveIntegerEnv(
+    'DEFAULT_NUM_CTX',
+  );
+  /**
+   * Computed once on module init from hardware + model size +
+   * architecture (all queried from Ollama for the actual loaded
+   * model). Drives every Ollama chat() and generate() call's
+   * num_ctx option, and is reported to callers via model.status so
+   * the orchestrator can size its prompt budget.
+   */
+  private contextWindow: ContextWindowComputation | null = null;
   private activeRequests = 0;
   private queueSequence = 0;
   private readonly waitQueue: QueueEntry[] = [];
@@ -113,18 +145,151 @@ export class LlmService implements OnModuleInit {
   });
 
   async onModuleInit(): Promise<void> {
+    // Compute target num_ctx from sources of truth before any
+    // request can land. If this fails, we still serve requests at
+    // the default num_ctx so the host stays available.
+    try {
+      this.contextWindow = await this.computeContextWindow();
+      const cw = this.contextWindow;
+      this.logger.log(
+        `Context window resolved: num_ctx=${cw.targetNumCtx}, ` +
+          `prompt budget=${this.promptBudgetTokens}, ` +
+          `kvPerToken=${Math.round(cw.kvPerTokenBytes)} B, ` +
+          `availableForKv=${formatBytes(cw.availableForKvBytes)}` +
+          (cw.fellBackToDefault
+            ? ` (fell back to default: ${cw.fallbackReason})`
+            : ''),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Context-window computation crashed; using default num_ctx=${this.defaultNumCtx}. ${getErrorMessage(error)}`,
+      );
+      this.contextWindow = {
+        targetNumCtx: this.defaultNumCtx,
+        rawMaxNumCtx: 0,
+        availableForKvBytes: 0,
+        kvPerTokenBytes: 0,
+        fellBackToDefault: true,
+        fallbackReason: getErrorMessage(error),
+      };
+    }
+
     if (!this.preloadModel) {
       return;
     }
 
     try {
       await this.preloadHostedModel();
-      this.logger.log(`Preloaded ${this.modelId} with keep_alive=${this.keepAliveText}`);
+      this.logger.log(
+        `Preloaded ${this.modelId} with keep_alive=${this.keepAliveText}, num_ctx=${this.numCtx}`,
+      );
     } catch (error) {
       this.logger.warn(
         `Could not preload ${this.modelId}. Requests will fail until Ollama can load it. ${getErrorMessage(error)}`,
       );
     }
+  }
+
+  private async computeContextWindow(): Promise<ContextWindowComputation> {
+    // Ollama's /api/show returns architecture (model_info) but NOT
+    // the model file size in bytes — that lives in /api/tags. So we
+    // fan out to both and merge.
+    let modelInfo: Record<string, unknown> | undefined;
+    let modelSizeBytes = 0;
+    try {
+      const show = (await this.ollama.show({
+        model: this.modelId,
+      })) as unknown as {
+        model_info?: Map<string, unknown> | Record<string, unknown>;
+      };
+      modelInfo = toPlainObject(show.model_info);
+    } catch (error) {
+      this.logger.warn(
+        `ollama.show failed; using default num_ctx=${this.defaultNumCtx}. ${getErrorMessage(error)}`,
+      );
+      return {
+        targetNumCtx: this.defaultNumCtx,
+        rawMaxNumCtx: 0,
+        availableForKvBytes: 0,
+        kvPerTokenBytes: 0,
+        fellBackToDefault: true,
+        fallbackReason: `ollama.show failed: ${getErrorMessage(error)}`,
+      };
+    }
+
+    try {
+      const list = (await this.ollama.list()) as unknown as {
+        models?: Array<{
+          name?: string;
+          model?: string;
+          size?: number;
+        }>;
+      };
+      const match = (list.models ?? []).find(
+        (m) => m.name === this.modelId || m.model === this.modelId,
+      );
+      if (match && typeof match.size === 'number' && match.size > 0) {
+        modelSizeBytes = match.size;
+      }
+    } catch (error) {
+      this.logger.warn(
+        `ollama.list failed when resolving model size; using default num_ctx=${this.defaultNumCtx}. ${getErrorMessage(error)}`,
+      );
+      return {
+        targetNumCtx: this.defaultNumCtx,
+        rawMaxNumCtx: 0,
+        availableForKvBytes: 0,
+        kvPerTokenBytes: 0,
+        fellBackToDefault: true,
+        fallbackReason: `ollama.list failed: ${getErrorMessage(error)}`,
+      };
+    }
+
+    if (modelSizeBytes <= 0) {
+      return {
+        targetNumCtx: this.defaultNumCtx,
+        rawMaxNumCtx: 0,
+        availableForKvBytes: 0,
+        kvPerTokenBytes: 0,
+        fellBackToDefault: true,
+        fallbackReason: `ollama.list did not include "${this.modelId}" or reported size 0; cannot compute KV memory budget.`,
+      };
+    }
+
+    const architecture = extractArchitectureFromModelInfo(modelInfo);
+    if (!architecture) {
+      return {
+        targetNumCtx: this.defaultNumCtx,
+        rawMaxNumCtx: 0,
+        availableForKvBytes:
+          this.hardware.totalVramBytes -
+          modelSizeBytes -
+          this.hardware.overheadReserveBytes,
+        kvPerTokenBytes: 0,
+        fellBackToDefault: true,
+        fallbackReason:
+          'Could not extract architecture (block_count/embedding_length/head_count) from ollama.show model_info.',
+      };
+    }
+
+    return computeTargetNumCtx({
+      hardware: this.hardware,
+      modelSizeBytes,
+      architecture,
+      defaultNumCtx: this.defaultNumCtx,
+    });
+  }
+
+  private get numCtx(): number {
+    return this.contextWindow?.targetNumCtx ?? this.defaultNumCtx;
+  }
+
+  private get promptBudgetTokens(): number {
+    return Math.floor(this.numCtx * this.promptBudgetFraction);
+  }
+
+  private get responseReserveTokens(): number {
+    return this.numCtx - this.promptBudgetTokens;
   }
 
   async streamInfer(
@@ -163,7 +328,11 @@ export class LlmService implements OnModuleInit {
         stream: true,
         keep_alive: this.keepAlive,
         think: appliedOptions.thinking,
-        options: appliedOptions.ollamaOptions,
+        // Always pass num_ctx so Ollama loads (or keeps loaded) the
+        // model with the computed window. Per-call options merge over
+        // any caller overrides — but if the caller explicitly passes
+        // its own num_ctx via options.ollama, that wins.
+        options: { num_ctx: this.numCtx, ...appliedOptions.ollamaOptions },
         ...(appliedOptions.responseFormat === 'json' ? { format: 'json' } : {}),
       });
 
@@ -221,6 +390,7 @@ export class LlmService implements OnModuleInit {
 
   async modelStatus(correlationId: string): Promise<ModelStatusResponse> {
     const state = await this.getRuntimeState();
+    const cw = this.contextWindow;
 
     return {
       meta: createApiMeta(correlationId),
@@ -236,6 +406,27 @@ export class LlmService implements OnModuleInit {
           modelSlots: MODEL_SLOTS,
           queueDepth: this.waitQueue.length,
           averageRequestDurationMs: this.averageRequestDurationMs,
+        },
+        // contextWindow is what callers (orchestrator, fragmenter)
+        // size their prompt budget against. Computed from hardware +
+        // model size + architecture at startup; see ./context-window.ts
+        // for the equations.
+        contextWindow: {
+          numCtx: this.numCtx,
+          promptBudgetTokens: this.promptBudgetTokens,
+          responseReserveTokens: this.responseReserveTokens,
+          promptBudgetFraction: this.promptBudgetFraction,
+          ...(cw
+            ? {
+                rawMaxNumCtx: cw.rawMaxNumCtx,
+                kvPerTokenBytes: cw.kvPerTokenBytes,
+                availableForKvBytes: cw.availableForKvBytes,
+                fellBackToDefault: cw.fellBackToDefault,
+                ...(cw.fallbackReason
+                  ? { fallbackReason: cw.fallbackReason }
+                  : {}),
+              }
+            : {}),
         },
         runtime: {
           ollamaHost: this.ollamaHost,
@@ -302,6 +493,9 @@ export class LlmService implements OnModuleInit {
       prompt: '',
       stream: false,
       keep_alive: this.keepAlive,
+      // Force Ollama to load the model with our computed num_ctx
+      // rather than its small default (typically 2048/4096).
+      options: { num_ctx: this.numCtx },
     });
   }
 
@@ -821,4 +1015,21 @@ function getErrorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes)) return String(bytes);
+  const gb = bytes / (1024 * 1024 * 1024);
+  if (gb >= 1) return `${gb.toFixed(2)} GB`;
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1) return `${mb.toFixed(2)} MB`;
+  return `${bytes} B`;
+}
+
+function toPlainObject(
+  value: Map<string, unknown> | Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  if (value instanceof Map) return Object.fromEntries(value);
+  return value;
 }

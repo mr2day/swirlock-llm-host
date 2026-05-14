@@ -86,6 +86,27 @@ export interface HealthData {
 
 export type HealthResponse = ApiEnvelope<HealthData>;
 
+export interface ModelContextWindow {
+  /** The num_ctx Ollama is asked to load the model with. */
+  numCtx: number;
+  /** Tokens the orchestrator can fill in the prompt. */
+  promptBudgetTokens: number;
+  /** Tokens reserved for the model's response. */
+  responseReserveTokens: number;
+  /** Fraction of numCtx allocated to the prompt (the rest is the response). */
+  promptBudgetFraction: number;
+  /** Pre-rounding output of the equation, for diagnostics. */
+  rawMaxNumCtx?: number;
+  /** KV cache cost per token in bytes, for diagnostics. */
+  kvPerTokenBytes?: number;
+  /** Bytes available for the KV cache after model + overhead. */
+  availableForKvBytes?: number;
+  /** True if any input was missing and we fell back to DEFAULT_NUM_CTX. */
+  fellBackToDefault?: boolean;
+  /** Human-readable fallback reason, present only when fellBackToDefault. */
+  fallbackReason?: string;
+}
+
 export interface ModelStatusData {
   modelId: string;
   availableModels: string[];
@@ -94,6 +115,7 @@ export interface ModelStatusData {
   keepAlive: string;
   capabilities: ModelCapabilities;
   capacity: ModelCapacity;
+  contextWindow: ModelContextWindow;
   runtime?: Record<string, unknown>;
 }
 

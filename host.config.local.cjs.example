@@ -11,5 +11,22 @@ module.exports = {
     OLLAMA_MODEL: 'gemma4:e4b',
     // Override OLLAMA_HOST here if Ollama is not on the default 127.0.0.1:11434.
     // OLLAMA_HOST: 'http://127.0.0.1:11434',
+
+    // PHYSICAL HARDWARE FACT OF THIS MACHINE. The LLM host uses this
+    // (together with the model size queried from Ollama and the
+    // model architecture params, also queried from Ollama) to compute
+    // the largest num_ctx that will actually fit in VRAM, via:
+    //
+    //   availableForKv = HARDWARE_TOTAL_VRAM_BYTES
+    //                  - modelSize
+    //                  - HARDWARE_OVERHEAD_RESERVE_BYTES
+    //   kvPerToken = 2 * numLayers * kvHeads * headDim
+    //              * HARDWARE_KV_CACHE_ELEMENT_BYTES
+    //   targetNumCtx = largestPowerOfTwoNotExceeding(
+    //                    floor(availableForKv / kvPerToken))
+    //
+    // Set this to your GPU's total VRAM in bytes (e.g. 16 GB =
+    // 16 * 1024**3 = 17179869184). Required.
+    HARDWARE_TOTAL_VRAM_BYTES: String(16 * 1024 * 1024 * 1024),
   },
 };
