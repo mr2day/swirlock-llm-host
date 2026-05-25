@@ -63,7 +63,10 @@ async function handleMessage(
     }
 
     if (envelope.type === 'health.get') {
-      const result = await llmService.health(correlationId);
+      const result = await llmService.health(
+        correlationId,
+        optionalBackend(envelope),
+      );
       sendEnvelope(socket, {
         type: 'health',
         correlationId,
@@ -73,9 +76,22 @@ async function handleMessage(
     }
 
     if (envelope.type === 'model.status') {
-      const result = await llmService.modelStatus(correlationId);
+      const result = await llmService.modelStatus(
+        correlationId,
+        optionalBackend(envelope),
+      );
       sendEnvelope(socket, {
         type: 'model.status',
+        correlationId,
+        payload: result.data,
+      });
+      return;
+    }
+
+    if (envelope.type === 'backends.list') {
+      const result = llmService.listBackends(correlationId);
+      sendEnvelope(socket, {
+        type: 'backends.list',
         correlationId,
         payload: result.data,
       });
@@ -86,6 +102,7 @@ async function handleMessage(
       const result = await llmService.preload(
         correlationId,
         requireRequest<ModelLifecycleRequest>(envelope),
+        optionalBackend(envelope),
       );
       sendEnvelope(socket, {
         type: 'model.preload',
@@ -99,6 +116,7 @@ async function handleMessage(
       const result = await llmService.unload(
         correlationId,
         requireRequest<ModelLifecycleRequest>(envelope),
+        optionalBackend(envelope),
       );
       sendEnvelope(socket, {
         type: 'model.unload',
@@ -110,7 +128,7 @@ async function handleMessage(
 
     if (envelope.type !== 'infer') {
       throw validationException(
-        'WebSocket message type must be infer, health.get, model.status, model.preload, model.unload, cancel, or heartbeat.',
+        'WebSocket message type must be infer, health.get, model.status, backends.list, model.preload, model.unload, cancel, or heartbeat.',
       );
     }
 
@@ -175,6 +193,18 @@ function requireRequest<T>(envelope: V4Envelope): T {
   }
 
   return envelope.payload.request as T;
+}
+
+/**
+ * Optional `backend` selector from the envelope payload (e.g. for
+ * `model.status` to ask for a non-default backend's status). Returns
+ * undefined when not present, in which case LlmService falls back to
+ * the default backend.
+ */
+function optionalBackend(envelope: V4Envelope): string | undefined {
+  if (!isRecord(envelope.payload)) return undefined;
+  const value = envelope.payload.backend;
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
 }
 
 function toEnvelope(event: StreamEvent, correlationId: string): V4Envelope {

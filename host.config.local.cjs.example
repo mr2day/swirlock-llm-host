@@ -5,6 +5,12 @@
 
 module.exports = {
   env: {
+    // === Backend selection ===
+    // Which backend this host serves with by default: 'ollama' | 'anthropic'.
+    // Defaults to 'ollama' in host.config.cjs.
+    // BACKEND: 'ollama',
+
+    // === Ollama backend (only used when BACKEND='ollama') ===
     // Comma-separated allow-list of models this host is permitted to serve.
     OLLAMA_MODELS: 'qwen3.5:9b,gemma4:e4b,qwen2.5-coder:14b',
     // The model this host actually runs. Must be one of OLLAMA_MODELS.
@@ -28,5 +34,18 @@ module.exports = {
     // Set this to your GPU's total VRAM in bytes (e.g. 16 GB =
     // 16 * 1024**3 = 17179869184). Required.
     HARDWARE_TOTAL_VRAM_BYTES: String(16 * 1024 * 1024 * 1024),
+
+    // === Anthropic backend (only used when BACKEND='anthropic',
+    //     OR when a per-request `backend: 'anthropic'` selector
+    //     reaches an `infer` call). Anthropic backend is only
+    //     instantiated when ANTHROPIC_API_KEY is set; without a key,
+    //     the host behaves byte-for-byte as the pre-refactor
+    //     Ollama-only version. ===
+    // ANTHROPIC_API_KEY: 'sk-ant-api03-...',
+    // Optional overrides — defaults in host.config.cjs.
+    // ANTHROPIC_MODEL: 'claude-haiku-4-5-20251001',
+    // ANTHROPIC_MODELS: 'claude-haiku-4-5-20251001,claude-sonnet-4-6,claude-opus-4-7',
+    // ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+    // ANTHROPIC_MAX_OUTPUT_TOKENS: '4096',
   },
 };

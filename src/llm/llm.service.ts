@@ -1,1061 +1,208 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { Ollama, type ChatResponse, type Message, type Options } from 'ollama';
-import { upstreamUnavailable, validationFailed } from './api-error';
-import {
-  computeTargetNumCtx,
-  extractArchitectureFromModelInfo,
-  type ContextWindowComputation,
-  type HardwareSpec,
-} from './context-window';
-import {
-  formatKeepAlive,
-  getRequiredBooleanEnv,
-  getRequiredFractionEnv,
-  getRequiredPositiveIntegerEnv,
-  getRequiredPositiveNumberEnv,
-  getRequiredStringEnv,
-  getRequiredStringListEnv,
-  parseKeepAlive,
-} from './runtime';
+import { validationFailed } from './api-error';
+import { AnthropicBackend } from './backends/anthropic-backend';
+import type {
+  Backend,
+  BackendInfo,
+  StreamEvent,
+} from './backends/backend.interface';
+import { OllamaBackend } from './backends/ollama-backend';
 import { createApiMeta } from './response-meta';
 import type {
   HealthResponse,
-  ImageInputPart,
   InferRequest,
-  InferenceOptions,
-  InputPart,
-  ModelCapabilities,
   ModelLifecycleRequest,
   ModelLifecycleResponse,
   ModelStatusResponse,
-  RequestContext,
 } from './types';
 
-const MODEL_SLOTS = 1;
-const RECENT_DURATION_SAMPLE_SIZE = 20;
-const LOWEST_PRIORITY = Number.NEGATIVE_INFINITY;
+export type { StreamEvent } from './backends/backend.interface';
 
-interface NormalizedInput {
-  messages: Message[];
+type BackendName = 'ollama' | 'anthropic';
+
+export interface BackendsListResponse {
+  meta: ReturnType<typeof createApiMeta>;
+  data: {
+    defaultBackend: BackendName;
+    backends: BackendInfo[];
+  };
 }
 
-interface AppliedOptions {
-  responseFormat: 'text' | 'json';
-  thinking: boolean;
-  publicOptions: InferenceOptions;
-  ollamaOptions: Partial<Options>;
-}
-
-interface RuntimeState {
-  ollamaReachable: boolean;
-  modelAvailable: boolean;
-  loaded: boolean;
-  version?: string;
-  error?: string;
-}
-
-interface QueueEntry {
-  sortPriority: number;
-  requestedPriority?: number;
-  sequence: number;
-  resolve: (slot: AcquiredModelSlot) => void;
-  reject: (error: Error) => void;
-  signal?: AbortSignal;
-  notifyQueued?: (info: QueueWaitInfo) => void;
-}
-
-interface NormalizedPriority {
-  sortPriority: number;
-  requestedPriority?: number;
-}
-
-interface AcquiredModelSlot {
-  release: () => void;
-}
-
-interface QueueWaitInfo {
-  position: number;
-  requestsAhead: number;
-  queueDepth: number;
-  defaultPriority: boolean;
-  priority?: number;
-  averageRequestDurationMs?: number;
-  estimatedWaitMs?: number;
-  estimatedStartAt?: string;
-}
-
-export type StreamEvent =
-  | { type: 'accepted'; meta: ReturnType<typeof createApiMeta> }
-  | { type: 'queued'; meta: ReturnType<typeof createApiMeta>; data: QueueWaitInfo }
-  | { type: 'started'; meta: ReturnType<typeof createApiMeta> }
-  | { type: 'thinking'; meta: ReturnType<typeof createApiMeta>; data: { text: string } }
-  | { type: 'chunk'; meta: ReturnType<typeof createApiMeta>; data: { text: string } }
-  | {
-      type: 'done';
-      meta: ReturnType<typeof createApiMeta>;
-      data: {
-        finishReason: 'stop' | 'length' | 'error';
-        appliedOptions: InferenceOptions;
-      };
-    };
-
+/**
+ * The public surface of the LLM host. Instantiates every configured
+ * backend at construction time and dispatches each request to the
+ * one the caller picks (or to the env-configured default).
+ *
+ * The default backend is always whatever the `BACKEND` env var says
+ * (`ollama` if unset). Other backends are instantiated only when
+ * their required env vars are present — Ollama always (its env vars
+ * are required), Anthropic only when `ANTHROPIC_API_KEY` is set.
+ * That keeps friends-on-Ollama deployments untouched after the
+ * refactor: no key, no Anthropic backend, no behaviour change.
+ */
 @Injectable()
 export class LlmService implements OnModuleInit {
   private readonly logger = new Logger(LlmService.name);
-  private readonly availableModels = getRequiredStringListEnv('OLLAMA_MODELS');
-  private readonly modelId = selectConfiguredModel(
-    getRequiredStringEnv('OLLAMA_MODEL'),
-    this.availableModels,
-  );
-  private readonly ollamaHost = getRequiredStringEnv('OLLAMA_HOST');
-  private readonly keepAlive = parseKeepAlive(getRequiredStringEnv('OLLAMA_KEEP_ALIVE'));
-  private readonly preloadModel = getRequiredBooleanEnv('PRELOAD_MODEL');
-  private readonly imageInputEnabled = getRequiredBooleanEnv('MODEL_IMAGE_INPUT');
-  private readonly thinkingEnabled = getRequiredBooleanEnv('MODEL_THINKING');
-  private readonly hardware: HardwareSpec = {
-    totalVramBytes: getRequiredPositiveIntegerEnv('HARDWARE_TOTAL_VRAM_BYTES'),
-    overheadReserveBytes: getRequiredPositiveIntegerEnv(
-      'HARDWARE_OVERHEAD_RESERVE_BYTES',
-    ),
-    kvCacheElementBytes: getRequiredPositiveNumberEnv(
-      'HARDWARE_KV_CACHE_ELEMENT_BYTES',
-    ),
-  };
-  private readonly promptBudgetFraction = getRequiredFractionEnv(
-    'PROMPT_BUDGET_FRACTION',
-  );
-  private readonly defaultNumCtx = getRequiredPositiveIntegerEnv(
-    'DEFAULT_NUM_CTX',
-  );
-  /**
-   * Computed once on module init from hardware + model size +
-   * architecture (all queried from Ollama for the actual loaded
-   * model). Drives every Ollama chat() and generate() call's
-   * num_ctx option, and is reported to callers via model.status so
-   * the orchestrator can size its prompt budget.
-   */
-  private contextWindow: ContextWindowComputation | null = null;
-  private activeRequests = 0;
-  private queueSequence = 0;
-  private readonly waitQueue: QueueEntry[] = [];
-  private readonly recentRequestDurationsMs: number[] = [];
+  private readonly defaultBackendName: BackendName;
+  private readonly backends: Partial<Record<BackendName, Backend>> = {};
 
-  private readonly ollama = new Ollama({
-    host: this.ollamaHost,
-  });
-
-  async onModuleInit(): Promise<void> {
-    // Try the equation once eagerly. If ollama isn't reachable yet,
-    // schedule background retries with backoff so we don't get stranded
-    // at the fallback num_ctx forever.
-    await this.tryResolveContextWindowAndPreload(1);
-  }
-
-  private async tryResolveContextWindowAndPreload(
-    attempt: number,
-  ): Promise<void> {
-    let cw: ContextWindowComputation;
-    try {
-      cw = await this.computeContextWindow();
-    } catch (error) {
-      this.logger.warn(
-        `Context-window computation crashed on attempt ${attempt}; using default num_ctx=${this.defaultNumCtx}. ${getErrorMessage(error)}`,
-      );
-      cw = {
-        targetNumCtx: this.defaultNumCtx,
-        rawMaxNumCtx: 0,
-        availableForKvBytes: 0,
-        kvPerTokenBytes: 0,
-        fellBackToDefault: true,
-        fallbackReason: getErrorMessage(error),
-      };
-    }
-
-    this.contextWindow = cw;
-    this.logger.log(
-      `Context window resolved (attempt ${attempt}): num_ctx=${cw.targetNumCtx}, ` +
-        `prompt budget=${this.promptBudgetTokens}, ` +
-        `kvPerToken=${Math.round(cw.kvPerTokenBytes)} B, ` +
-        `availableForKv=${formatBytes(cw.availableForKvBytes)}` +
-        (cw.fellBackToDefault
-          ? ` (fell back to default: ${cw.fallbackReason})`
-          : ''),
+  constructor() {
+    this.defaultBackendName = resolveBackendName(
+      (process.env.BACKEND ?? 'ollama').trim(),
     );
 
-    if (this.preloadModel) {
+    // Ollama is the historical default; its env vars are required by
+    // host.config.cjs, so it always instantiates cleanly on main.
+    try {
+      this.backends['ollama'] = new OllamaBackend();
+    } catch (error) {
+      this.logger.warn(
+        `OllamaBackend unavailable: ${getErrorMessage(error)}`,
+      );
+    }
+
+    // Anthropic instantiates only when ANTHROPIC_API_KEY is set, so
+    // hosts without a key keep their pre-refactor behaviour byte-for-
+    // byte (Ollama only, exposed to UI as the sole backend choice).
+    if ((process.env.ANTHROPIC_API_KEY ?? '').trim().length > 0) {
       try {
-        await this.preloadHostedModel();
-        this.logger.log(
-          `Preloaded ${this.modelId} with keep_alive=${this.keepAliveText}, num_ctx=${this.numCtx} (attempt ${attempt})`,
-        );
+        this.backends['anthropic'] = new AnthropicBackend();
       } catch (error) {
         this.logger.warn(
-          `Could not preload ${this.modelId} on attempt ${attempt}. Requests will fail until Ollama can load it. ${getErrorMessage(error)}`,
+          `AnthropicBackend unavailable: ${getErrorMessage(error)}`,
         );
       }
     }
 
-    if (cw.fellBackToDefault && isTransientFallback(cw.fallbackReason)) {
-      const backoffMs = Math.min(2000 * 2 ** Math.min(attempt - 1, 5), 60_000);
-      this.logger.warn(
-        `Context-window fell back to default because ollama was unreachable; ` +
-          `retrying in ${backoffMs}ms (next attempt ${attempt + 1}).`,
+    if (!this.backends[this.defaultBackendName]) {
+      throw new Error(
+        `Default BACKEND='${this.defaultBackendName}' is not available. ` +
+          `Configured backends: ${Object.keys(this.backends).join(', ') || '(none)'}`,
       );
-      setTimeout(() => {
-        void this.tryResolveContextWindowAndPreload(attempt + 1);
-      }, backoffMs);
     }
+
+    this.logger.log(
+      `LLM host backends configured: ${Object.keys(this.backends).join(', ')} ` +
+        `(default: ${this.defaultBackendName})`,
+    );
   }
 
-  private async computeContextWindow(): Promise<ContextWindowComputation> {
-    // Ollama's /api/show returns architecture (model_info) but NOT
-    // the model file size in bytes — that lives in /api/tags. So we
-    // fan out to both and merge.
-    let modelInfo: Record<string, unknown> | undefined;
-    let modelSizeBytes = 0;
-    try {
-      const show = (await this.ollama.show({
-        model: this.modelId,
-      })) as unknown as {
-        model_info?: Map<string, unknown> | Record<string, unknown>;
-      };
-      modelInfo = toPlainObject(show.model_info);
-    } catch (error) {
-      this.logger.warn(
-        `ollama.show failed; using default num_ctx=${this.defaultNumCtx}. ${getErrorMessage(error)}`,
-      );
-      return {
-        targetNumCtx: this.defaultNumCtx,
-        rawMaxNumCtx: 0,
-        availableForKvBytes: 0,
-        kvPerTokenBytes: 0,
-        fellBackToDefault: true,
-        fallbackReason: `ollama.show failed: ${getErrorMessage(error)}`,
-      };
-    }
-
-    try {
-      const list = (await this.ollama.list()) as unknown as {
-        models?: Array<{
-          name?: string;
-          model?: string;
-          size?: number;
-        }>;
-      };
-      const match = (list.models ?? []).find(
-        (m) => m.name === this.modelId || m.model === this.modelId,
-      );
-      if (match && typeof match.size === 'number' && match.size > 0) {
-        modelSizeBytes = match.size;
+  async onModuleInit(): Promise<void> {
+    for (const backend of Object.values(this.backends)) {
+      if (backend?.init) {
+        try {
+          await backend.init();
+        } catch (error) {
+          this.logger.warn(
+            `Backend ${backend.name} init failed: ${getErrorMessage(error)}`,
+          );
+        }
       }
-    } catch (error) {
-      this.logger.warn(
-        `ollama.list failed when resolving model size; using default num_ctx=${this.defaultNumCtx}. ${getErrorMessage(error)}`,
-      );
-      return {
-        targetNumCtx: this.defaultNumCtx,
-        rawMaxNumCtx: 0,
-        availableForKvBytes: 0,
-        kvPerTokenBytes: 0,
-        fellBackToDefault: true,
-        fallbackReason: `ollama.list failed: ${getErrorMessage(error)}`,
-      };
     }
-
-    if (modelSizeBytes <= 0) {
-      return {
-        targetNumCtx: this.defaultNumCtx,
-        rawMaxNumCtx: 0,
-        availableForKvBytes: 0,
-        kvPerTokenBytes: 0,
-        fellBackToDefault: true,
-        fallbackReason: `ollama.list did not include "${this.modelId}" or reported size 0; cannot compute KV memory budget.`,
-      };
-    }
-
-    const architecture = extractArchitectureFromModelInfo(modelInfo);
-    if (!architecture) {
-      return {
-        targetNumCtx: this.defaultNumCtx,
-        rawMaxNumCtx: 0,
-        availableForKvBytes:
-          this.hardware.totalVramBytes -
-          modelSizeBytes -
-          this.hardware.overheadReserveBytes,
-        kvPerTokenBytes: 0,
-        fellBackToDefault: true,
-        fallbackReason:
-          'Could not extract architecture (block_count/embedding_length/head_count) from ollama.show model_info.',
-      };
-    }
-
-    return computeTargetNumCtx({
-      hardware: this.hardware,
-      modelSizeBytes,
-      architecture,
-      defaultNumCtx: this.defaultNumCtx,
-    });
   }
 
-  private get numCtx(): number {
-    return this.contextWindow?.targetNumCtx ?? this.defaultNumCtx;
-  }
-
-  private get promptBudgetTokens(): number {
-    return Math.floor(this.numCtx * this.promptBudgetFraction);
-  }
-
-  private get responseReserveTokens(): number {
-    return this.numCtx - this.promptBudgetTokens;
-  }
-
-  async streamInfer(
+  streamInfer(
     correlationId: string,
     request: InferRequest,
     emit: (event: StreamEvent) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    this.assertRequestContext(request?.requestContext);
-
-    const meta = createApiMeta(correlationId);
-    emit({ type: 'accepted', meta });
-
-    const slot = await this.acquireModelSlot(request.requestContext.priority, signal, (waitInfo) =>
-      emit({ type: 'queued', meta, data: waitInfo }),
-    );
-
-    try {
-      const input = await this.normalizeInput(request);
-      const appliedOptions = this.normalizeOptions(request.options);
-
-      emit({ type: 'started', meta });
-
-      console.log(
-        '===== OLLAMA CALL =====\n' +
-          'model: ' + this.modelId + '\n' +
-          'think: ' + appliedOptions.thinking + '\n' +
-          'options: ' + JSON.stringify(appliedOptions.ollamaOptions) + '\n' +
-          'format: ' + (appliedOptions.responseFormat === 'json' ? 'json' : '(none)') + '\n' +
-          '=======================',
-      );
-
-      const stream = await this.ollama.chat({
-        model: this.modelId,
-        messages: input.messages,
-        stream: true,
-        keep_alive: this.keepAlive,
-        think: appliedOptions.thinking,
-        // Always pass num_ctx so Ollama loads (or keeps loaded) the
-        // model with the computed window. Per-call options merge over
-        // any caller overrides — but if the caller explicitly passes
-        // its own num_ctx via options.ollama, that wins.
-        options: { num_ctx: this.numCtx, ...appliedOptions.ollamaOptions },
-        ...(appliedOptions.responseFormat === 'json' ? { format: 'json' } : {}),
-      });
-
-      const abortStream = () => stream.abort();
-      signal?.addEventListener('abort', abortStream, { once: true });
-
-      let finalChunk: ChatResponse | undefined;
-
-      try {
-        for await (const chunk of stream) {
-          if (signal?.aborted) {
-            break;
-          }
-
-          finalChunk = chunk;
-
-          if (chunk.message?.thinking) {
-            emit({ type: 'thinking', meta, data: { text: chunk.message.thinking } });
-          }
-
-          if (chunk.message?.content) {
-            emit({ type: 'chunk', meta, data: { text: chunk.message.content } });
-          }
-        }
-      } finally {
-        signal?.removeEventListener('abort', abortStream);
-      }
-
-      emit({
-        type: 'done',
-        meta,
-        data: {
-          finishReason: mapFinishReason(finalChunk?.done_reason),
-          appliedOptions: appliedOptions.publicOptions,
-        },
-      });
-    } catch (error) {
-      throw this.normalizeUpstreamError(error);
-    } finally {
-      slot.release();
-    }
+    const backend = this.resolveBackend(request?.backend);
+    return backend.streamInfer(correlationId, request, emit, signal);
   }
 
-  async health(correlationId: string): Promise<HealthResponse> {
-    const state = await this.getRuntimeState();
+  health(correlationId: string, backendName?: string): Promise<HealthResponse> {
+    const backend = this.resolveBackend(backendName);
+    return backend.health(correlationId);
+  }
+
+  modelStatus(
+    correlationId: string,
+    backendName?: string,
+  ): Promise<ModelStatusResponse> {
+    const backend = this.resolveBackend(backendName);
+    return backend.modelStatus(correlationId);
+  }
+
+  preload(
+    correlationId: string,
+    request: ModelLifecycleRequest,
+    backendName?: string,
+  ): Promise<ModelLifecycleResponse> {
+    const backend = this.resolveBackend(backendName);
+    return backend.preload(correlationId, request);
+  }
+
+  unload(
+    correlationId: string,
+    request: ModelLifecycleRequest,
+    backendName?: string,
+  ): Promise<ModelLifecycleResponse> {
+    const backend = this.resolveBackend(backendName);
+    return backend.unload(correlationId, request);
+  }
+
+  /**
+   * Lists every backend this host has been configured to serve. Used
+   * by the UI's model picker to render its dropdown. Includes the
+   * default backend name so the UI can highlight it as the initial
+   * selection when the user hasn't picked yet.
+   */
+  listBackends(correlationId: string): BackendsListResponse {
+    const backends: BackendInfo[] = [];
+    // Stable iteration order: default first, then the rest.
+    const defaultBackend = this.backends[this.defaultBackendName];
+    if (defaultBackend) backends.push(defaultBackend.info);
+    for (const [name, backend] of Object.entries(this.backends) as Array<
+      [BackendName, Backend | undefined]
+    >) {
+      if (!backend) continue;
+      if (name === this.defaultBackendName) continue;
+      backends.push(backend.info);
+    }
 
     return {
       meta: createApiMeta(correlationId),
       data: {
-        status: state.modelAvailable ? 'ok' : state.ollamaReachable ? 'degraded' : 'unavailable',
-        ready: state.modelAvailable,
+        defaultBackend: this.defaultBackendName,
+        backends,
       },
     };
   }
 
-  async modelStatus(correlationId: string): Promise<ModelStatusResponse> {
-    const state = await this.getRuntimeState();
-    const cw = this.contextWindow;
-
-    return {
-      meta: createApiMeta(correlationId),
-      data: {
-        modelId: this.modelId,
-        availableModels: this.availableModels,
-        ready: state.modelAvailable,
-        loaded: state.loaded,
-        keepAlive: this.keepAliveText,
-        capabilities: this.capabilities,
-        capacity: {
-          activeRequests: this.activeRequests,
-          modelSlots: MODEL_SLOTS,
-          queueDepth: this.waitQueue.length,
-          averageRequestDurationMs: this.averageRequestDurationMs,
-        },
-        // contextWindow is what callers (orchestrator, fragmenter)
-        // size their prompt budget against. Computed from hardware +
-        // model size + architecture at startup; see ./context-window.ts
-        // for the equations.
-        contextWindow: {
-          numCtx: this.numCtx,
-          promptBudgetTokens: this.promptBudgetTokens,
-          responseReserveTokens: this.responseReserveTokens,
-          promptBudgetFraction: this.promptBudgetFraction,
-          ...(cw
-            ? {
-                rawMaxNumCtx: cw.rawMaxNumCtx,
-                kvPerTokenBytes: cw.kvPerTokenBytes,
-                availableForKvBytes: cw.availableForKvBytes,
-                fellBackToDefault: cw.fellBackToDefault,
-                ...(cw.fallbackReason
-                  ? { fallbackReason: cw.fallbackReason }
-                  : {}),
-              }
-            : {}),
-        },
-        runtime: {
-          ollamaHost: this.ollamaHost,
-          ollamaReachable: state.ollamaReachable,
-          version: state.version,
-          thinkingEnabled: this.thinkingEnabled,
-          error: state.error,
-        },
-      },
-    };
-  }
-
-  async preload(
-    correlationId: string,
-    request: ModelLifecycleRequest,
-  ): Promise<ModelLifecycleResponse> {
-    this.assertRequestContext(request?.requestContext);
-
-    try {
-      await this.preloadHostedModel();
-      return {
-        meta: createApiMeta(correlationId),
-        data: {
-          accepted: true,
-          modelId: this.modelId,
-          status: 'loaded',
-        },
-      };
-    } catch (error) {
-      throw this.normalizeUpstreamError(error);
-    }
-  }
-
-  async unload(
-    correlationId: string,
-    request: ModelLifecycleRequest,
-  ): Promise<ModelLifecycleResponse> {
-    this.assertRequestContext(request?.requestContext);
-
-    try {
-      await this.ollama.generate({
-        model: this.modelId,
-        prompt: '',
-        stream: false,
-        keep_alive: 0,
-      });
-
-      return {
-        meta: createApiMeta(correlationId),
-        data: {
-          accepted: true,
-          modelId: this.modelId,
-          status: 'unloaded',
-        },
-      };
-    } catch (error) {
-      throw this.normalizeUpstreamError(error);
-    }
-  }
-
-  private async preloadHostedModel(): Promise<void> {
-    await this.ollama.generate({
-      model: this.modelId,
-      prompt: '',
-      stream: false,
-      keep_alive: this.keepAlive,
-      // Force Ollama to load the model with our computed num_ctx
-      // rather than its small default (typically 2048/4096).
-      options: { num_ctx: this.numCtx },
-    });
-  }
-
-  private async normalizeInput(request: InferRequest): Promise<NormalizedInput> {
-    if (!isRecord(request?.input)) {
-      throw validationFailed('input must be an object.');
+  private resolveBackend(backendName: string | undefined): Backend {
+    if (backendName === undefined || backendName === null || backendName === '') {
+      return this.backends[this.defaultBackendName] as Backend;
     }
 
-    const parts = Array.isArray(request.input.parts) ? request.input.parts : undefined;
-    const rawMessages = Array.isArray(request.input.messages) ? request.input.messages : undefined;
-    if (!parts && !rawMessages) {
-      throw validationFailed('input.parts or input.messages must be a non-empty array.');
-    }
-
-    const messages: Message[] = rawMessages ? this.normalizeMessages(rawMessages) : [];
-    const textParts: string[] = [];
-    const images: string[] = [];
-
-    if (parts) {
-      if (parts.length === 0 && !rawMessages) {
-        throw validationFailed('input.parts must contain at least one part.');
-      }
-
-      for (const [index, part] of parts.entries()) {
-        if (!isRecord(part)) {
-          throw validationFailed(`input.parts[${index}] must be an object.`);
-        }
-
-        if (part.type === 'text') {
-          textParts.push(this.normalizeTextPart(part as unknown as InputPart, index));
-          continue;
-        }
-
-        if (part.type === 'image') {
-          images.push(await this.normalizeImagePart(part as unknown as ImageInputPart, index));
-          continue;
-        }
-
-        throw validationFailed(`input.parts[${index}].type must be text or image.`);
-      }
-    }
-
-    const text = textParts.join('\n\n').trim();
-
-    if (rawMessages) {
-      if (text) {
-        messages.push({ role: 'user', content: text });
-      }
-      if (images.length > 0) {
-        this.attachImagesToLastUserMessage(messages, images);
-      }
-      if (messages.length === 0) {
-        throw validationFailed('input.messages must contain at least one message.');
-      }
-      return { messages };
-    }
-
-    if (!text && images.length === 0) {
-      throw validationFailed('Inference input must include text, images, or both.');
-    }
-
-    return {
-      messages: [
-        {
-          role: 'user',
-          content: text,
-          ...(images.length > 0 ? { images } : {}),
-        },
-      ],
-    };
-  }
-
-  private normalizeMessages(value: unknown): Message[] {
-    if (!Array.isArray(value)) {
-      throw validationFailed('input.messages must be an array.');
-    }
-
-    if (value.length === 0) return [];
-
-    return value.map((message, index) => {
-      if (!isRecord(message)) {
-        throw validationFailed(`input.messages[${index}] must be an object.`);
-      }
-
-      const role = message.role;
-      if (role !== 'system' && role !== 'user' && role !== 'assistant') {
-        throw validationFailed(`input.messages[${index}].role must be system, user, or assistant.`);
-      }
-
-      if (typeof message.content !== 'string' || !message.content.trim()) {
-        throw validationFailed(`input.messages[${index}].content must be a non-empty string.`);
-      }
-
-      return { role, content: message.content };
-    });
-  }
-
-  private attachImagesToLastUserMessage(messages: Message[], images: string[]): void {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (message.role !== 'user') continue;
-      (message as Message & { images?: string[] }).images = images;
-      return;
-    }
-
-    throw validationFailed('Image parts require at least one user message.');
-  }
-
-  private normalizeTextPart(part: InputPart, index: number): string {
-    if (part.type !== 'text' || typeof part.text !== 'string') {
-      throw validationFailed(`input.parts[${index}].text must be a string.`);
-    }
-
-    return part.text;
-  }
-
-  private async normalizeImagePart(part: ImageInputPart, index: number): Promise<string> {
-    if (!this.imageInputEnabled) {
-      throw validationFailed('This model host does not accept image input.');
-    }
-
-    const hasBase64 = typeof part.imageBase64 === 'string' && part.imageBase64.trim().length > 0;
-    const hasUrl = typeof part.imageUrl === 'string' && part.imageUrl.trim().length > 0;
-
-    if (hasBase64 === hasUrl) {
+    const normalized = backendName.trim().toLowerCase();
+    if (normalized !== 'ollama' && normalized !== 'anthropic') {
       throw validationFailed(
-        `input.parts[${index}] must include exactly one of imageBase64 or imageUrl.`,
+        `Unknown backend "${backendName}". Configured: ${Object.keys(this.backends).join(', ')}.`,
       );
     }
 
-    return hasBase64
-      ? this.normalizeImageBase64(part.imageBase64 as string, index)
-      : this.fetchImageUrl(part.imageUrl as string, index);
+    const backend = this.backends[normalized];
+    if (!backend) {
+      throw validationFailed(
+        `Backend "${normalized}" is not configured on this host. Configured: ${Object.keys(this.backends).join(', ')}.`,
+      );
+    }
+    return backend;
   }
+}
 
-  private normalizeImageBase64(value: string, index: number): string {
-    const normalized = stripDataUrlPrefix(value).replace(/\s+/g, '');
-
-    if (!normalized) {
-      throw validationFailed(`input.parts[${index}].imageBase64 is empty.`);
-    }
-
-    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(normalized)) {
-      throw validationFailed(`input.parts[${index}].imageBase64 is not valid base64.`);
-    }
-
-    Buffer.from(normalized, 'base64');
-
+function resolveBackendName(raw: string): BackendName {
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === 'ollama' || normalized === 'anthropic') {
     return normalized;
   }
-
-  private async fetchImageUrl(value: string, index: number): Promise<string> {
-    let url: URL;
-    try {
-      url = new URL(value);
-    } catch {
-      throw validationFailed(`input.parts[${index}].imageUrl must be a valid URL.`);
-    }
-
-    if (!['http:', 'https:'].includes(url.protocol)) {
-      throw validationFailed(`input.parts[${index}].imageUrl must use http or https.`);
-    }
-
-    const response = await fetch(url, {
-      headers: { Accept: 'image/*' },
-    });
-
-    if (!response.ok) {
-      throw upstreamUnavailable('Could not fetch imageUrl.', {
-        partIndex: index,
-        status: response.status,
-      });
-    }
-
-    const contentType = response.headers.get('content-type');
-    if (contentType && !contentType.toLowerCase().startsWith('image/')) {
-      throw validationFailed(`input.parts[${index}].imageUrl did not return an image.`);
-    }
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    return buffer.toString('base64');
-  }
-
-  private normalizeOptions(options: InferRequest['options']): AppliedOptions {
-    if (options !== undefined && !isRecord(options)) {
-      throw validationFailed('options must be an object.');
-    }
-
-    const responseFormat = normalizeResponseFormat(options?.responseFormat);
-    // Caller may request thinking, but the configured model has to actually
-    // support it. If MODEL_THINKING=false, forward `think: false` to Ollama
-    // regardless of the request — otherwise Ollama errors out for non-thinking
-    // models (e.g. gemma3:12b returns "Ollama request failed").
-    const thinkingRequested =
-      typeof options?.thinking === 'boolean' ? options.thinking : this.thinkingEnabled;
-    const thinking = this.thinkingEnabled && thinkingRequested;
-    const ollamaOptions = normalizeOllamaOptions(options?.ollama);
-
-    const publicOptions: InferenceOptions = {
-      responseFormat,
-      thinking,
-      ...(ollamaOptions !== undefined ? { ollama: ollamaOptions } : {}),
-    };
-
-    return {
-      responseFormat,
-      thinking,
-      publicOptions,
-      ollamaOptions: (ollamaOptions ?? {}) as Partial<Options>,
-    };
-  }
-
-  private acquireModelSlot(
-    priority: RequestContext['priority'],
-    signal?: AbortSignal,
-    onQueued?: (waitInfo: QueueWaitInfo) => void,
-  ): Promise<AcquiredModelSlot> {
-    if (this.activeRequests < MODEL_SLOTS) {
-      return Promise.resolve(this.startModelSlot());
-    }
-
-    const normalizedPriority = normalizePriority(priority);
-
-    return new Promise((resolve, reject) => {
-      const entry: QueueEntry = {
-        sortPriority: normalizedPriority.sortPriority,
-        requestedPriority: normalizedPriority.requestedPriority,
-        sequence: this.queueSequence++,
-        resolve,
-        reject,
-        signal,
-        notifyQueued: onQueued,
-      };
-
-      const abortQueued = () => {
-        const index = this.waitQueue.indexOf(entry);
-        if (index >= 0) {
-          this.waitQueue.splice(index, 1);
-          this.emitQueueUpdates();
-          reject(validationFailed('Queued model request was aborted before it started.'));
-        }
-      };
-
-      signal?.addEventListener('abort', abortQueued, { once: true });
-
-      this.waitQueue.push(entry);
-      this.emitQueueUpdates();
-    });
-  }
-
-  private startModelSlot(): AcquiredModelSlot {
-    const startedAt = Date.now();
-    this.activeRequests += 1;
-
-    return {
-      release: () => this.releaseModelSlot(startedAt),
-    };
-  }
-
-  private releaseModelSlot(startedAt: number): void {
-    this.recordRequestDuration(Date.now() - startedAt);
-    this.activeRequests = Math.max(0, this.activeRequests - 1);
-    this.startNextQueuedRequest();
-  }
-
-  private startNextQueuedRequest(): void {
-    if (this.activeRequests >= MODEL_SLOTS || this.waitQueue.length === 0) {
-      return;
-    }
-
-    const nextIndex = this.nextQueueIndex();
-    const [entry] = this.waitQueue.splice(nextIndex, 1);
-
-    if (entry.signal?.aborted) {
-      entry.reject(validationFailed('Queued model request was aborted before it started.'));
-      this.startNextQueuedRequest();
-      return;
-    }
-
-    const slot = this.startModelSlot();
-    this.emitQueueUpdates();
-    entry.resolve(slot);
-  }
-
-  private nextQueueIndex(): number {
-    let bestIndex = 0;
-
-    for (let index = 1; index < this.waitQueue.length; index += 1) {
-      const candidate = this.waitQueue[index];
-      const best = this.waitQueue[bestIndex];
-      if (compareQueueEntries(candidate, best) < 0) {
-        bestIndex = index;
-      }
-    }
-
-    return bestIndex;
-  }
-
-  private emitQueueUpdates(): void {
-    for (const entry of this.waitQueue) {
-      entry.notifyQueued?.(this.queueWaitInfo(entry));
-    }
-  }
-
-  private queueWaitInfo(entry: QueueEntry): QueueWaitInfo {
-    const position = this.queuePosition(entry);
-    const requestsAhead = this.activeRequests + position - 1;
-    const averageRequestDurationMs = this.averageRequestDurationMs;
-    const estimatedWaitMs =
-      averageRequestDurationMs !== undefined ? requestsAhead * averageRequestDurationMs : undefined;
-    const estimatedStartAt =
-      estimatedWaitMs !== undefined
-        ? new Date(Date.now() + estimatedWaitMs).toISOString()
-        : undefined;
-
-    return {
-      position,
-      requestsAhead,
-      queueDepth: this.waitQueue.length,
-      defaultPriority: entry.requestedPriority === undefined,
-      ...(entry.requestedPriority !== undefined ? { priority: entry.requestedPriority } : {}),
-      averageRequestDurationMs,
-      estimatedWaitMs,
-      estimatedStartAt,
-    };
-  }
-
-  private queuePosition(entry: QueueEntry): number {
-    return this.waitQueue.slice().sort(compareQueueEntries).indexOf(entry) + 1;
-  }
-
-  private recordRequestDuration(durationMs: number): void {
-    this.recentRequestDurationsMs.push(durationMs);
-
-    if (this.recentRequestDurationsMs.length > RECENT_DURATION_SAMPLE_SIZE) {
-      this.recentRequestDurationsMs.shift();
-    }
-  }
-
-  private get averageRequestDurationMs(): number | undefined {
-    if (this.recentRequestDurationsMs.length === 0) {
-      return undefined;
-    }
-
-    const total = this.recentRequestDurationsMs.reduce((sum, value) => sum + value, 0);
-    return Math.round(total / this.recentRequestDurationsMs.length);
-  }
-
-  private assertRequestContext(context: RequestContext | undefined): void {
-    if (!isRecord(context)) {
-      throw validationFailed('requestContext is required.');
-    }
-
-    if (typeof context.callerService !== 'string' || !context.callerService.trim()) {
-      throw validationFailed('requestContext.callerService is required.');
-    }
-
-    if (
-      context.priority !== undefined &&
-      (typeof context.priority !== 'number' || !Number.isFinite(context.priority))
-    ) {
-      throw validationFailed('requestContext.priority must be a finite number when provided.');
-    }
-
-    if (
-      typeof context.requestedAt !== 'string' ||
-      !context.requestedAt.endsWith('Z') ||
-      Number.isNaN(Date.parse(context.requestedAt))
-    ) {
-      throw validationFailed('requestContext.requestedAt must be an ISO 8601 UTC timestamp.');
-    }
-  }
-
-  private async getRuntimeState(): Promise<RuntimeState> {
-    const [versionResult, showResult, psResult] = await Promise.allSettled([
-      this.ollama.version(),
-      this.ollama.show({ model: this.modelId }),
-      this.ollama.ps(),
-    ]);
-
-    const loaded =
-      psResult.status === 'fulfilled' &&
-      psResult.value.models.some(
-        (model) => model.name === this.modelId || model.model === this.modelId,
-      );
-
-    return {
-      ollamaReachable: versionResult.status === 'fulfilled',
-      modelAvailable: showResult.status === 'fulfilled',
-      loaded,
-      version: versionResult.status === 'fulfilled' ? versionResult.value.version : undefined,
-      error:
-        versionResult.status === 'rejected'
-          ? getErrorMessage(versionResult.reason)
-          : showResult.status === 'rejected'
-            ? getErrorMessage(showResult.reason)
-            : undefined,
-    };
-  }
-
-  private normalizeUpstreamError(error: unknown): Error {
-    if (error instanceof Error && error.name === 'AbortError') {
-      return upstreamUnavailable('Ollama request was aborted.', {
-        modelId: this.modelId,
-      });
-    }
-
-    if (isApiErrorException(error)) {
-      return error;
-    }
-
-    return upstreamUnavailable('Ollama request failed.', {
-      modelId: this.modelId,
-      detail: getErrorMessage(error),
-    });
-  }
-
-  private get capabilities(): ModelCapabilities {
-    return {
-      textInput: true,
-      imageInput: this.imageInputEnabled,
-      textOutput: true,
-      imageOutput: false,
-    };
-  }
-
-  private get keepAliveText(): string {
-    return formatKeepAlive(this.keepAlive);
-  }
-}
-
-function normalizeResponseFormat(value: unknown): 'text' | 'json' {
-  if (value === undefined) {
-    return 'text';
-  }
-
-  if (value === 'text' || value === 'json') {
-    return value;
-  }
-
-  throw validationFailed('options.responseFormat must be text or json.');
-}
-
-function selectConfiguredModel(modelId: string, availableModels: string[]): string {
-  if (availableModels.includes(modelId)) {
-    return modelId;
-  }
-
   throw new Error(
-    `OLLAMA_MODEL must be one of OLLAMA_MODELS. Received "${modelId}". Allowed: ${availableModels.join(', ')}`,
-  );
-}
-
-function normalizePriority(value: RequestContext['priority']): NormalizedPriority {
-  if (value === undefined) {
-    return { sortPriority: LOWEST_PRIORITY };
-  }
-
-  return { sortPriority: value, requestedPriority: value };
-}
-
-function compareQueueEntries(a: QueueEntry, b: QueueEntry): number {
-  if (a.sortPriority > b.sortPriority) {
-    return -1;
-  }
-
-  if (a.sortPriority < b.sortPriority) {
-    return 1;
-  }
-
-  return a.sequence - b.sequence;
-}
-
-function normalizeOllamaOptions(value: unknown): Record<string, unknown> | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-
-  if (!isRecord(value)) {
-    throw validationFailed('options.ollama must be an object.');
-  }
-
-  return value;
-}
-
-function mapFinishReason(value: string | undefined): 'stop' | 'length' | 'error' {
-  if (value === 'length') {
-    return 'length';
-  }
-  if (value === 'error') {
-    return 'error';
-  }
-  return 'stop';
-}
-
-function stripDataUrlPrefix(value: string): string {
-  const trimmed = value.trim();
-  const dataUrlMatch = /^data:image\/[-+.a-zA-Z0-9]+;base64,(?<data>.*)$/s.exec(trimmed);
-  return dataUrlMatch?.groups?.data ?? trimmed;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isApiErrorException(value: unknown): value is Error {
-  return (
-    value instanceof Error &&
-    typeof (value as { getStatus?: unknown }).getStatus === 'function' &&
-    typeof (value as { getResponse?: unknown }).getResponse === 'function'
+    `BACKEND must be one of: ollama, anthropic. Received "${raw}".`,
   );
 }
 
 function getErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
+  if (error instanceof Error) return error.message;
   return String(error);
-}
-
-function isTransientFallback(reason: string | undefined): boolean {
-  if (typeof reason !== 'string') return false;
-  return (
-    reason.startsWith('ollama.show failed') ||
-    reason.startsWith('ollama.list failed') ||
-    reason.includes('did not include')
-  );
-}
-
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes)) return String(bytes);
-  const gb = bytes / (1024 * 1024 * 1024);
-  if (gb >= 1) return `${gb.toFixed(2)} GB`;
-  const mb = bytes / (1024 * 1024);
-  if (mb >= 1) return `${mb.toFixed(2)} MB`;
-  return `${bytes} B`;
-}
-
-function toPlainObject(
-  value: Map<string, unknown> | Record<string, unknown> | undefined,
-): Record<string, unknown> | undefined {
-  if (!value) return undefined;
-  if (value instanceof Map) return Object.fromEntries(value);
-  return value;
 }

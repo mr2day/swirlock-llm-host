@@ -10,12 +10,34 @@ const defaults = {
   NODE_ENV: 'production',
   PORT: '3213',
   HOST: '0.0.0.0',
+
+  // Which backend implementation this host instance serves with. One of:
+  //   'ollama'    — local Ollama (default; current behavior preserved)
+  //   'anthropic' — Anthropic API (api.anthropic.com)
+  // Override in host.config.local.cjs per machine. The orchestrator
+  // can still override per-request via the `backend` field in
+  // `infer`, but only against backends this host has been configured
+  // to instantiate (Anthropic only initializes when ANTHROPIC_API_KEY
+  // is present).
+  BACKEND: 'ollama',
+
   OLLAMA_HOST: 'http://127.0.0.1:11434',
   OLLAMA_KEEP_ALIVE: '-1',
   PRELOAD_MODEL: 'true',
   MODEL_IMAGE_INPUT: 'true',
   MODEL_THINKING: 'false',
   JSON_BODY_LIMIT: '256mb',
+
+  // Anthropic backend defaults. ANTHROPIC_API_KEY has no default by
+  // design — it must be set per-machine in host.config.local.cjs.
+  // Override ANTHROPIC_MODEL / ANTHROPIC_MODELS per machine.
+  ANTHROPIC_MODEL: 'claude-haiku-4-5-20251001',
+  ANTHROPIC_MODELS:
+    'claude-haiku-4-5-20251001,claude-sonnet-4-6,claude-opus-4-7',
+  ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+  // Max tokens for Anthropic responses. The official SDK requires
+  // this on every messages call. Tune per workload.
+  ANTHROPIC_MAX_OUTPUT_TOKENS: '4096',
   // KV cache element size in bytes. The default fp16 is 2 bytes per
   // K/V element. Set to 1 if you run Ollama with
   // OLLAMA_KV_CACHE_TYPE=q8_0 (halves the KV memory cost) or 0.5 for

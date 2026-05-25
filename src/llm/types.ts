@@ -63,6 +63,18 @@ export interface InferRequest {
   requestContext: RequestContext;
   input: InferenceInput;
   options?: InferenceOptions;
+  /**
+   * Optional backend selector. When omitted, the host routes to its
+   * configured default (the `BACKEND` env var). When present, must
+   * match a backend the host has been configured to serve. Backends
+   * not configured for this host instance reject with
+   * `validation_failed`.
+   *
+   * Recognised values:
+   *   'ollama'    — local Ollama
+   *   'anthropic' — Anthropic API
+   */
+  backend?: 'ollama' | 'anthropic';
 }
 
 export interface ModelCapabilities {

@@ -29,6 +29,7 @@
   },
   "homepage": "https://github.com/mr2day/swirlock-llm-host#readme",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.98.0",
     "@nestjs/common": "^11.1.19",
     "@nestjs/core": "^11.1.19",
     "@nestjs/platform-express": "^11.1.19",
